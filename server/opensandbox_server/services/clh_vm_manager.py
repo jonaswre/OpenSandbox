@@ -21,12 +21,11 @@ execd readiness, and tear down resources on sandbox deletion.
 """
 
 import asyncio
-import json
+import itertools
 import logging
 import os
 import random
 import shutil
-import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,14 +53,6 @@ class CLHVMInstance:
     memory_mb: int
     created_at: float = field(default_factory=time.time)
     execd_port: int = 8080
-    _pid: Optional[int] = field(default=None, init=False)
-
-    def __post_init__(self):
-        self._pid = self.process.pid
-
-    @property
-    def pid(self) -> Optional[int]:
-        return self._pid
 
     @property
     def execd_url(self) -> str:
@@ -79,10 +70,23 @@ class CLHVMManager:
         self.config = config
         self.vms: dict[str, CLHVMInstance] = {}
         self._ip_counter = 2  # Start at .2 (bridge is .1)
+        self._http_client: Optional[httpx.AsyncClient] = None
         self._ensure_directories()
 
     def _ensure_directories(self):
         Path(self.config.api_socket_dir).mkdir(parents=True, exist_ok=True)
+
+    async def _get_http_client(self) -> httpx.AsyncClient:
+        """Lazily create a persistent httpx client for health checks."""
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(timeout=3.0)
+        return self._http_client
+
+    async def close(self):
+        """Shut down persistent HTTP client. Call on server shutdown."""
+        if self._http_client and not self._http_client.is_closed:
+            await self._http_client.aclose()
+            self._http_client = None
 
     # ------------------------------------------------------------------
     # Image management
@@ -92,41 +96,38 @@ class CLHVMManager:
         """Resolve image name to a base image path in the image directory."""
         image_dir = Path(self.config.image_dir)
 
-        # Try exact name first, then common extensions
         for suffix in ("", ".qcow2", ".raw", ".img"):
             candidate = image_dir / f"{image_name}{suffix}"
             if candidate.exists():
                 return candidate
 
+        available = [f.name for f in itertools.islice(image_dir.iterdir(), 10)]
         raise FileNotFoundError(
             f"Windows base image '{image_name}' not found in {image_dir}. "
-            f"Available images: {[f.name for f in image_dir.iterdir() if f.is_file()]}"
+            f"Available images (first 10): {available}"
         )
 
-    def _create_overlay(self, sandbox_id: str, image_name: str) -> Path:
+    async def _create_overlay(self, sandbox_id: str, image_name: str) -> Path:
         """Create a copy-on-write overlay image from the base image."""
         base_image = self._resolve_base_image(image_name)
         overlay_dir = Path(self.config.image_dir) / "overlays"
         overlay_dir.mkdir(parents=True, exist_ok=True)
         overlay_path = overlay_dir / f"{sandbox_id}.qcow2"
 
-        # Determine backing format from extension
         backing_fmt = "raw" if base_image.suffix == ".raw" else "qcow2"
 
-        result = subprocess.run(
-            [
-                "qemu-img", "create",
-                "-f", "qcow2",
-                "-b", str(base_image),
-                "-F", backing_fmt,
-                str(overlay_path),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=30,
+        proc = await asyncio.create_subprocess_exec(
+            "qemu-img", "create",
+            "-f", "qcow2",
+            "-b", str(base_image),
+            "-F", backing_fmt,
+            str(overlay_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
-        if result.returncode != 0:
-            raise RuntimeError(f"Failed to create overlay image: {result.stderr}")
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        if proc.returncode != 0:
+            raise RuntimeError(f"Failed to create overlay image: {stderr.decode()}")
 
         logger.info("Created COW overlay %s (backing: %s)", overlay_path, base_image)
         return overlay_path
@@ -143,40 +144,40 @@ class CLHVMManager:
         return ":".join(f"{b:02x}" for b in octets)
 
     def _allocate_ip(self) -> str:
-        """Allocate the next guest IP on the bridge subnet (10.44.0.0/24)."""
-        ip = f"10.44.0.{self._ip_counter}"
-        self._ip_counter += 1
-        if self._ip_counter > 254:
-            self._ip_counter = 2
-        return ip
+        """Allocate an unused guest IP on the bridge subnet (10.44.0.0/24)."""
+        used = {vm.guest_ip for vm in self.vms.values()}
+        for _ in range(253):
+            ip = f"10.44.0.{self._ip_counter}"
+            self._ip_counter = 2 if self._ip_counter >= 254 else self._ip_counter + 1
+            if ip not in used:
+                return ip
+        raise RuntimeError("IP pool exhausted (10.44.0.0/24)")
 
-    def _create_tap(self, sandbox_id: str) -> str:
+    async def _create_tap(self, sandbox_id: str) -> str:
         """Create a TAP device and attach it to the bridge."""
         tap_name = f"tap-{sandbox_id[:8]}"
 
-        try:
-            subprocess.run(
-                ["ip", "tuntap", "add", "dev", tap_name, "mode", "tap"],
-                check=True, capture_output=True, text=True, timeout=10,
+        for cmd_args in [
+            ["ip", "tuntap", "add", "dev", tap_name, "mode", "tap"],
+            ["ip", "link", "set", tap_name, "master", self.config.network_bridge],
+            ["ip", "link", "set", tap_name, "up"],
+        ]:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd_args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            subprocess.run(
-                ["ip", "link", "set", tap_name, "master", self.config.network_bridge],
-                check=True, capture_output=True, text=True, timeout=10,
-            )
-            subprocess.run(
-                ["ip", "link", "set", tap_name, "up"],
-                check=True, capture_output=True, text=True, timeout=10,
-            )
-        except subprocess.CalledProcessError as e:
-            logger.error("Failed to create TAP device %s: %s", tap_name, e.stderr)
-            raise RuntimeError(f"TAP creation failed: {e.stderr}") from e
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+            if proc.returncode != 0:
+                raise RuntimeError(f"TAP setup failed ({cmd_args[2:]}): {stderr.decode()}")
 
         logger.info("Created TAP device %s on bridge %s", tap_name, self.config.network_bridge)
         return tap_name
 
     def _destroy_tap(self, tap_name: str):
-        """Remove a TAP device."""
+        """Remove a TAP device (best-effort, sync is fine for cleanup)."""
         try:
+            import subprocess
             subprocess.run(
                 ["ip", "link", "delete", tap_name],
                 capture_output=True, text=True, timeout=10,
@@ -202,15 +203,11 @@ class CLHVMManager:
         effective_cpus = cpus or self.config.default_cpus
         effective_memory = memory_mb or self.config.default_memory_mb
 
-        # Create COW overlay
-        overlay_path = self._create_overlay(sandbox_id, image_name)
-
-        # Set up networking
-        tap_device = self._create_tap(sandbox_id)
+        overlay_path = await self._create_overlay(sandbox_id, image_name)
+        tap_device = await self._create_tap(sandbox_id)
         mac_address = self._generate_mac()
         guest_ip = self._allocate_ip()
 
-        # Build CLH command
         api_socket = Path(self.config.api_socket_dir) / f"{sandbox_id}.sock"
 
         cmd = [
@@ -224,6 +221,10 @@ class CLHVMManager:
             "--console", "off",
             "--api-socket", str(api_socket),
         ]
+
+        if self.config.hyperv_enlightenments:
+            # Append kvm_hyperv to the existing --cpus arg
+            cmd[cmd.index("--cpus") + 1] += ",kvm_hyperv=on"
 
         logger.info(
             "Starting CLH VM %s: cpus=%d, memory=%dMB, image=%s",
@@ -249,7 +250,6 @@ class CLHVMManager:
             execd_port=self.config.execd_port,
         )
 
-        # Wait for execd to become reachable
         try:
             await self._wait_for_execd(vm)
         except TimeoutError:
@@ -258,7 +258,7 @@ class CLHVMManager:
             raise
 
         self.vms[sandbox_id] = vm
-        logger.info("VM %s is ready (pid=%s, ip=%s)", sandbox_id, vm.pid, guest_ip)
+        logger.info("VM %s is ready (pid=%s, ip=%s)", sandbox_id, process.pid, guest_ip)
         return vm
 
     async def destroy_vm(self, sandbox_id: str):
@@ -272,7 +272,6 @@ class CLHVMManager:
 
     async def _force_destroy(self, vm: CLHVMInstance):
         """Force-stop a VM and clean up resources."""
-        # Try graceful shutdown via CLH API socket
         if vm.api_socket.exists():
             try:
                 await self._clh_api_request(vm.api_socket, "PUT", "/api/v1/vm.shutdown")
@@ -283,7 +282,6 @@ class CLHVMManager:
             except Exception:
                 logger.debug("Graceful shutdown failed for %s, killing", vm.sandbox_id)
 
-        # Force kill if still running
         if vm.is_running:
             try:
                 vm.process.kill()
@@ -291,18 +289,15 @@ class CLHVMManager:
             except Exception:
                 logger.warning("Could not kill CLH process for %s", vm.sandbox_id)
 
-        # Clean up resources
-        if vm.overlay_path.exists():
-            try:
-                os.unlink(vm.overlay_path)
-            except OSError:
-                logger.warning("Failed to remove overlay %s", vm.overlay_path)
+        try:
+            vm.overlay_path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Failed to remove overlay %s", vm.overlay_path)
 
-        if vm.api_socket.exists():
-            try:
-                os.unlink(vm.api_socket)
-            except OSError:
-                pass
+        try:
+            vm.api_socket.unlink(missing_ok=True)
+        except OSError:
+            pass
 
         self._destroy_tap(vm.tap_device)
 
@@ -319,15 +314,12 @@ class CLHVMManager:
         logger.info("VM %s resumed", sandbox_id)
 
     def get_vm(self, sandbox_id: str) -> Optional[CLHVMInstance]:
-        """Get a VM instance by sandbox ID, or None."""
         return self.vms.get(sandbox_id)
 
     def list_vms(self) -> list[CLHVMInstance]:
-        """List all managed VM instances."""
         return list(self.vms.values())
 
     def _get_vm(self, sandbox_id: str) -> CLHVMInstance:
-        """Get a VM instance, raising KeyError if not found."""
         vm = self.vms.get(sandbox_id)
         if vm is None:
             raise KeyError(f"VM {sandbox_id} not found")
@@ -338,29 +330,32 @@ class CLHVMManager:
     # ------------------------------------------------------------------
 
     async def _wait_for_execd(self, vm: CLHVMInstance):
-        """Poll execd health endpoint until it responds or timeout."""
+        """Poll execd health endpoint with backoff until it responds or timeout."""
         deadline = time.time() + self.config.boot_timeout_seconds
         url = f"{vm.execd_url}/ping"
+        client = await self._get_http_client()
 
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            while time.time() < deadline:
-                if not vm.is_running:
-                    stderr = ""
-                    if vm.process.stderr:
-                        stderr = (await vm.process.stderr.read()).decode(errors="replace")
-                    raise RuntimeError(
-                        f"CLH process exited with code {vm.process.returncode} "
-                        f"before execd became ready. stderr: {stderr[:500]}"
-                    )
-                try:
-                    resp = await client.get(url)
-                    if resp.status_code == 200:
-                        logger.info("execd ready at %s", vm.execd_url)
-                        return
-                except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout, OSError):
-                    pass
+        # Exponential backoff: 2s, 3s, 4.5s, capping at 5s
+        delay = 2.0
+        while time.time() < deadline:
+            if not vm.is_running:
+                stderr = ""
+                if vm.process.stderr:
+                    stderr = (await vm.process.stderr.read()).decode(errors="replace")
+                raise RuntimeError(
+                    f"CLH process exited with code {vm.process.returncode} "
+                    f"before execd became ready. stderr: {stderr[:500]}"
+                )
+            try:
+                resp = await client.get(url)
+                if resp.status_code == 200:
+                    logger.info("execd ready at %s", vm.execd_url)
+                    return
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout, OSError):
+                pass
 
-                await asyncio.sleep(2)
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.5, 5.0)
 
         raise TimeoutError(
             f"execd at {vm.execd_url} did not become ready within "
@@ -374,9 +369,9 @@ class CLHVMManager:
             return False
 
         try:
-            async with httpx.AsyncClient(timeout=3.0) as client:
-                resp = await client.get(f"{vm.execd_url}/ping")
-                return resp.status_code == 200
+            client = await self._get_http_client()
+            resp = await client.get(f"{vm.execd_url}/ping")
+            return resp.status_code == 200
         except Exception:
             return False
 
@@ -392,12 +387,7 @@ class CLHVMManager:
         transport = httpx.AsyncHTTPTransport(uds=str(socket_path))
         async with httpx.AsyncClient(transport=transport, timeout=10.0) as client:
             url = f"http://localhost{path}"
-            if method.upper() == "GET":
-                resp = await client.get(url)
-            elif method.upper() == "PUT":
-                resp = await client.put(url, json=body)
-            else:
-                resp = await client.request(method.upper(), url, json=body)
+            resp = await client.request(method.upper(), url, json=body)
 
             if resp.status_code >= 400:
                 raise RuntimeError(
@@ -437,7 +427,6 @@ class CLHVMManager:
                 f"Create it and place prepared Windows .qcow2 images inside."
             )
 
-        # Check qemu-img is available (needed for COW overlays)
         if not shutil.which("qemu-img"):
             raise ValueError(
                 "qemu-img not found in PATH. Install qemu-utils for COW overlay support."

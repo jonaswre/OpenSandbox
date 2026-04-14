@@ -356,9 +356,6 @@ var envKeysNotPersisted = map[string]bool{
 	"PROMPT_COMMAND": true,
 }
 
-// maxPersistedEnvValueSize caps single env value length as a safeguard.
-const maxPersistedEnvValueSize = 8 * 1024
-
 func parseExportDump(lines []string) map[string]string {
 	if len(lines) == 0 {
 		return nil
@@ -401,49 +398,6 @@ func parseExportLine(line string) (string, string, bool) {
 
 func shellEscape(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
-}
-
-func isValidEnvKey(key string) bool {
-	if key == "" {
-		return false
-	}
-
-	for i, r := range key {
-		if i == 0 {
-			if (r < 'A' || (r > 'Z' && r < 'a') || r > 'z') && r != '_' {
-				return false
-			}
-			continue
-		}
-		if (r < 'A' || (r > 'Z' && r < 'a') || r > 'z') && (r < '0' || r > '9') && r != '_' {
-			return false
-		}
-	}
-
-	return true
-}
-
-func copyEnvMap(src map[string]string) map[string]string {
-	if src == nil {
-		return map[string]string{}
-	}
-
-	dst := make(map[string]string, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
-}
-
-func splitEnvPair(kv string) (string, string, bool) {
-	parts := strings.SplitN(kv, "=", 2)
-	if len(parts) != 2 {
-		return "", "", false
-	}
-	if !isValidEnvKey(parts[0]) {
-		return "", "", false
-	}
-	return parts[0], parts[1], true
 }
 
 func (s *bashSession) close() error {

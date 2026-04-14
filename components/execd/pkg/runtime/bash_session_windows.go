@@ -61,7 +61,7 @@ type powershellSession struct {
 func newPowershellSession(cwd string) *powershellSession {
 	env := make(map[string]string)
 	for _, kv := range os.Environ() {
-		if k, v, ok := psSplitvEnvPair(kv); ok {
+		if k, v, ok := splitEnvPair(kv); ok {
 			env[k] = v
 		}
 	}
@@ -105,7 +105,7 @@ func (s *powershellSession) run(ctx context.Context, request *ExecuteCodeRequest
 		return errors.New("session not started")
 	}
 
-	envSnapshot := psCopyEnvMap(s.env)
+	envSnapshot := copyEnvMap(s.env)
 	cwd := s.cwd
 	if request.Cwd != "" {
 		cwd = request.Cwd
@@ -143,8 +143,9 @@ func (s *powershellSession) run(ctx context.Context, request *ExecuteCodeRequest
 	}
 	defer func() { _ = os.Remove(scriptPath) }()
 
-	// -ExecutionPolicy Bypass allows running unsigned scripts in restricted environments.
-	cmd := exec.CommandContext(ctx, "powershell.exe",
+	// Use getShell() for consistency with command execution (prefers pwsh over powershell).
+	shell := getShell()
+	cmd := exec.CommandContext(ctx, shell,
 		"-NoProfile",
 		"-NonInteractive",
 		"-ExecutionPolicy", "Bypass",
@@ -183,8 +184,7 @@ func (s *powershellSession) run(ctx context.Context, request *ExecuteCodeRequest
 			inEnv = false
 		case strings.HasPrefix(line, psExitMarkerPrefix):
 			if code, err := strconv.Atoi(strings.TrimPrefix(line, psExitMarkerPrefix)); err == nil {
-				exitCode = &code //nolint:ineffassign
-			}
+				exitCode = &code			}
 		case strings.HasPrefix(line, psPwdMarkerPrefix):
 			pwdLine = strings.TrimPrefix(line, psPwdMarkerPrefix)
 		default:
@@ -213,8 +213,7 @@ func (s *powershellSession) run(ctx context.Context, request *ExecuteCodeRequest
 
 	if exitCode == nil && cmd.ProcessState != nil {
 		code := cmd.ProcessState.ExitCode() //nolint:staticcheck
-		exitCode = &code                    //nolint:ineffassign
-	}
+		exitCode = &code                   	}
 
 	updatedEnv := parsePSEnvDump(envLines)
 	s.mu.Lock()
@@ -332,11 +331,6 @@ var psEnvKeysNotPersisted = map[string]bool{
 	"PROMPT": true,
 }
 
-// maxPersistedEnvValueSize is shared with bash_session.go via the package-level
-// declaration there; we redeclare it here for the Windows-only build so the
-// Windows compilation unit remains self-contained.
-const maxPersistedEnvValueSize = 8 * 1024
-
 // parsePSEnvDump converts "KEY=VALUE" lines emitted by Get-ChildItem Env:
 // into a map. Values may contain "=" so we split only on the first occurrence.
 func parsePSEnvDump(lines []string) map[string]string {
@@ -367,28 +361,6 @@ func parsePSEnvDump(lines []string) map[string]string {
 // single quotes by doubling them (PowerShell convention: '' inside '...').
 func psSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
-}
-
-func psCopyEnvMap(src map[string]string) map[string]string {
-	if src == nil {
-		return map[string]string{}
-	}
-	dst := make(map[string]string, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
-}
-
-func psSplitvEnvPair(kv string) (string, string, bool) {
-	parts := strings.SplitN(kv, "=", 2)
-	if len(parts) != 2 {
-		return "", "", false
-	}
-	if !isValidEnvKey(parts[0]) {
-		return "", "", false
-	}
-	return parts[0], parts[1], true
 }
 
 // Controller-level helpers that mirror the Linux createBashSession / runBashSession /
@@ -455,22 +427,3 @@ func (c *Controller) DeleteBashSession(sessionID string) error {
 	return c.closePowershellSession(sessionID)
 }
 
-// isValidEnvKey is declared in bash_session.go (!windows build). Redeclare it
-// here so the Windows compilation unit is self-contained.
-func isValidEnvKey(key string) bool {
-	if key == "" {
-		return false
-	}
-	for i, r := range key {
-		if i == 0 {
-			if (r < 'A' || (r > 'Z' && r < 'a') || r > 'z') && r != '_' {
-				return false
-			}
-			continue
-		}
-		if (r < 'A' || (r > 'Z' && r < 'a') || r > 'z') && (r < '0' || r > '9') && r != '_' {
-			return false
-		}
-	}
-	return true
-}

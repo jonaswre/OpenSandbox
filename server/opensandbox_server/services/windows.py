@@ -20,8 +20,10 @@ full Cloud Hypervisor VM booted from a pre-built Windows disk image with execd
 pre-installed as a Windows service.
 """
 
+import asyncio
 import json
 import logging
+import math
 import threading
 from datetime import datetime, timezone
 from typing import Optional
@@ -32,6 +34,7 @@ from opensandbox_server.api.schema import (
     CreateSandboxRequest,
     CreateSandboxResponse,
     Endpoint,
+    ImageSpec,
     ListSandboxesRequest,
     ListSandboxesResponse,
     PaginationInfo,
@@ -43,27 +46,13 @@ from opensandbox_server.api.schema import (
 )
 from opensandbox_server.config import AppConfig, get_config
 from opensandbox_server.services.clh_vm_manager import CLHVMManager
+from opensandbox_server.services.constants import SandboxErrorCodes
+from opensandbox_server.services.helpers import matches_filter, parse_memory_limit, parse_nano_cpus
 from opensandbox_server.services.sandbox_service import SandboxService
 
 logger = logging.getLogger(__name__)
 
 
-class WindowsErrorCodes:
-    """Error codes for Windows sandbox service."""
-
-    VM_NOT_FOUND = "WINDOWS::VM_NOT_FOUND"
-    VM_CREATE_FAILED = "WINDOWS::VM_CREATE_FAILED"
-    VM_DELETE_FAILED = "WINDOWS::VM_DELETE_FAILED"
-    VM_PAUSE_FAILED = "WINDOWS::VM_PAUSE_FAILED"
-    VM_RESUME_FAILED = "WINDOWS::VM_RESUME_FAILED"
-    VM_NOT_RUNNING = "WINDOWS::VM_NOT_RUNNING"
-    VM_NOT_PAUSED = "WINDOWS::VM_NOT_PAUSED"
-    INVALID_GUEST_OS = "WINDOWS::INVALID_GUEST_OS"
-    BOOT_TIMEOUT = "WINDOWS::BOOT_TIMEOUT"
-    INVALID_PORT = "WINDOWS::INVALID_PORT"
-
-
-# Sandbox metadata stored alongside CLHVMInstance
 class _SandboxMeta:
     """Metadata tracked per sandbox that CLHVMInstance doesn't store."""
 
@@ -110,6 +99,24 @@ class WindowsSandboxService(SandboxService):
         self._max_timeout = self.app_config.server.max_sandbox_timeout_seconds
 
     # ------------------------------------------------------------------
+    # Async bridge — awaits the coroutine from sync context
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _run_async(coro):
+        """Run an async coroutine from a sync method, handling both cases."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+            return future.result(timeout=60)
+        else:
+            return asyncio.run(coro)
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
@@ -119,21 +126,16 @@ class WindowsSandboxService(SandboxService):
         if meta is None:
             raise HTTPException(
                 status_code=404,
-                detail={"code": WindowsErrorCodes.VM_NOT_FOUND, "message": f"Sandbox {sandbox_id} not found"},
+                detail={"code": SandboxErrorCodes.WINDOWS_VM_NOT_FOUND, "message": f"Sandbox {sandbox_id} not found"},
             )
         return meta
 
-    def _build_sandbox_status(self, meta: _SandboxMeta) -> SandboxStatus:
-        return SandboxStatus(state=meta.status)
-
     def _build_sandbox(self, meta: _SandboxMeta) -> Sandbox:
-        from opensandbox_server.api.schema import ImageSpec
-
         return Sandbox(
             id=meta.sandbox_id,
             image=ImageSpec(uri=meta.image_uri),
             platform=meta.platform,
-            status=self._build_sandbox_status(meta),
+            status=SandboxStatus(state=meta.status),
             metadata=meta.metadata,
             entrypoint=meta.entrypoint,
             expires_at=meta.expires_at,
@@ -141,6 +143,7 @@ class WindowsSandboxService(SandboxService):
         )
 
     def _schedule_expiration(self, meta: _SandboxMeta):
+        """Must be called while self._lock is NOT held (timer callback acquires it)."""
         if meta.expires_at is None:
             return
         delay = (meta.expires_at - datetime.now(timezone.utc)).total_seconds()
@@ -157,12 +160,15 @@ class WindowsSandboxService(SandboxService):
         timer = threading.Timer(delay, _expire)
         timer.daemon = True
         timer.start()
-        meta.expiration_timer = timer
+        with self._lock:
+            meta.expiration_timer = timer
 
     def _cancel_expiration(self, meta: _SandboxMeta):
-        if meta.expiration_timer is not None:
-            meta.expiration_timer.cancel()
+        with self._lock:
+            timer = meta.expiration_timer
             meta.expiration_timer = None
+        if timer is not None:
+            timer.cancel()
 
     # ------------------------------------------------------------------
     # SandboxService implementation
@@ -172,33 +178,33 @@ class WindowsSandboxService(SandboxService):
         sandbox_id = self.generate_sandbox_id()
         now = datetime.now(timezone.utc)
 
+        # Validate guest_os matches this runtime
+        if hasattr(request, "guest_os") and request.guest_os != "windows":
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": SandboxErrorCodes.INVALID_PARAMETER,
+                    "message": f"This server runs Windows sandboxes but guest_os='{request.guest_os}' was requested",
+                },
+            )
+
         # Compute expiration
         expires_at = None
         if request.timeout is not None:
             capped = min(request.timeout, self._max_timeout) if self._max_timeout else request.timeout
             expires_at = datetime.fromtimestamp(now.timestamp() + capped, tz=timezone.utc)
 
-        # Parse resource limits for CPU/memory overrides
+        # Parse resource limits using shared helpers
         cpus = None
         memory_mb = None
         if request.resource_limits and request.resource_limits.root:
             rl = request.resource_limits.root
-            if "cpu" in rl:
-                try:
-                    cpus = int(rl["cpu"].rstrip("m")) if rl["cpu"].endswith("m") else int(rl["cpu"])
-                except ValueError:
-                    pass
-            if "memory" in rl:
-                raw = rl["memory"]
-                try:
-                    if raw.endswith("Mi"):
-                        memory_mb = int(raw[:-2])
-                    elif raw.endswith("Gi"):
-                        memory_mb = int(raw[:-2]) * 1024
-                    else:
-                        memory_mb = int(raw)
-                except ValueError:
-                    pass
+            nano_cpus = parse_nano_cpus(rl.get("cpu"))
+            if nano_cpus is not None:
+                cpus = max(1, math.ceil(nano_cpus / 1_000_000_000))
+            memory_bytes = parse_memory_limit(rl.get("memory"))
+            if memory_bytes is not None:
+                memory_mb = max(1024, memory_bytes // (1024 * 1024))
 
         platform = request.platform or PlatformSpec(os="windows", arch="amd64")
 
@@ -222,18 +228,18 @@ class WindowsSandboxService(SandboxService):
         except FileNotFoundError as e:
             raise HTTPException(
                 status_code=400,
-                detail={"code": WindowsErrorCodes.VM_CREATE_FAILED, "message": str(e)},
+                detail={"code": SandboxErrorCodes.WINDOWS_VM_CREATE_FAILED, "message": str(e)},
             ) from e
         except TimeoutError as e:
             raise HTTPException(
                 status_code=504,
-                detail={"code": WindowsErrorCodes.BOOT_TIMEOUT, "message": str(e)},
+                detail={"code": SandboxErrorCodes.WINDOWS_BOOT_TIMEOUT, "message": str(e)},
             ) from e
         except Exception as e:
             logger.exception("Failed to create Windows sandbox %s", sandbox_id)
             raise HTTPException(
                 status_code=500,
-                detail={"code": WindowsErrorCodes.VM_CREATE_FAILED, "message": str(e)},
+                detail={"code": SandboxErrorCodes.WINDOWS_VM_CREATE_FAILED, "message": str(e)},
             ) from e
 
         with self._lock:
@@ -255,35 +261,21 @@ class WindowsSandboxService(SandboxService):
         with self._lock:
             all_meta = list(self._meta.values())
 
-        # Apply filters
-        filtered = all_meta
-        if request.filter.state:
-            states = set(request.filter.state)
-            filtered = [m for m in filtered if m.status in states]
-        if request.filter.metadata:
-            for key, value in request.filter.metadata.items():
-                filtered = [
-                    m for m in filtered
-                    if m.metadata and m.metadata.get(key) == value
-                ]
-
+        sandboxes = [self._build_sandbox(m) for m in all_meta]
+        filtered = [s for s in sandboxes if matches_filter(s, request.filter)]
         total = len(filtered)
 
-        # Pagination
         page = 1
         page_size = 20
         if request.pagination:
             page = request.pagination.page
             page_size = request.pagination.page_size
         start = (page - 1) * page_size
-        end = start + page_size
-        page_items = filtered[start:end]
-
-        sandboxes = [self._build_sandbox(m) for m in page_items]
+        page_items = filtered[start:start + page_size]
 
         total_pages = (total + page_size - 1) // page_size if page_size else 1
         return ListSandboxesResponse(
-            items=sandboxes,
+            items=page_items,
             pagination=PaginationInfo(
                 page=page,
                 page_size=page_size,
@@ -301,64 +293,37 @@ class WindowsSandboxService(SandboxService):
         meta = self._get_meta(sandbox_id)
         self._cancel_expiration(meta)
 
-        import asyncio
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
-
-        if loop and loop.is_running():
-            # Schedule destruction in the running loop
-            asyncio.ensure_future(self.vm_manager.destroy_vm(sandbox_id))
-        else:
-            asyncio.run(self.vm_manager.destroy_vm(sandbox_id))
+        self._run_async(self.vm_manager.destroy_vm(sandbox_id))
 
         with self._lock:
             self._meta.pop(sandbox_id, None)
-
-        meta.status = "Terminated"
+            meta.status = "Terminated"
 
     def pause_sandbox(self, sandbox_id: str) -> None:
         meta = self._get_meta(sandbox_id)
         if meta.status != "Running":
             raise HTTPException(
                 status_code=409,
-                detail={"code": WindowsErrorCodes.VM_NOT_RUNNING, "message": "Sandbox is not running"},
+                detail={"code": SandboxErrorCodes.WINDOWS_VM_NOT_RUNNING, "message": "Sandbox is not running"},
             )
 
-        import asyncio
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
+        self._run_async(self.vm_manager.pause_vm(sandbox_id))
 
-        if loop and loop.is_running():
-            asyncio.ensure_future(self.vm_manager.pause_vm(sandbox_id))
-        else:
-            asyncio.run(self.vm_manager.pause_vm(sandbox_id))
-
-        meta.status = "Paused"
+        with self._lock:
+            meta.status = "Paused"
 
     def resume_sandbox(self, sandbox_id: str) -> None:
         meta = self._get_meta(sandbox_id)
         if meta.status != "Paused":
             raise HTTPException(
                 status_code=409,
-                detail={"code": WindowsErrorCodes.VM_NOT_PAUSED, "message": "Sandbox is not paused"},
+                detail={"code": SandboxErrorCodes.WINDOWS_VM_NOT_RUNNING, "message": "Sandbox is not paused"},
             )
 
-        import asyncio
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
+        self._run_async(self.vm_manager.resume_vm(sandbox_id))
 
-        if loop and loop.is_running():
-            asyncio.ensure_future(self.vm_manager.resume_vm(sandbox_id))
-        else:
-            asyncio.run(self.vm_manager.resume_vm(sandbox_id))
-
-        meta.status = "Running"
+        with self._lock:
+            meta.status = "Running"
 
     def renew_expiration(
         self, sandbox_id: str, request: RenewSandboxExpirationRequest,
@@ -370,7 +335,8 @@ class WindowsSandboxService(SandboxService):
         if new_expires.tzinfo is None:
             new_expires = new_expires.replace(tzinfo=timezone.utc)
 
-        meta.expires_at = new_expires
+        with self._lock:
+            meta.expires_at = new_expires
         self._schedule_expiration(meta)
 
         return RenewSandboxExpirationResponse(expires_at=new_expires)
@@ -387,7 +353,7 @@ class WindowsSandboxService(SandboxService):
 
         lines = [
             f"Windows VM {sandbox_id}",
-            f"  PID: {vm.pid}",
+            f"  PID: {vm.process.pid}",
             f"  IP: {vm.guest_ip}",
             f"  Status: {meta.status}",
             f"  Created: {meta.created_at.isoformat()}",
@@ -409,42 +375,36 @@ class WindowsSandboxService(SandboxService):
             "expires_at": meta.expires_at.isoformat() if meta.expires_at else None,
         }
         if vm:
-            info.update({
-                "vm": {
-                    "pid": vm.pid,
-                    "guest_ip": vm.guest_ip,
-                    "mac_address": vm.mac_address,
-                    "cpus": vm.cpus,
-                    "memory_mb": vm.memory_mb,
-                    "tap_device": vm.tap_device,
-                    "overlay_path": str(vm.overlay_path),
-                    "api_socket": str(vm.api_socket),
-                    "execd_url": vm.execd_url,
-                    "is_running": vm.is_running,
-                },
-            })
+            info["vm"] = {
+                "pid": vm.process.pid,
+                "guest_ip": vm.guest_ip,
+                "mac_address": vm.mac_address,
+                "cpus": vm.cpus,
+                "memory_mb": vm.memory_mb,
+                "tap_device": vm.tap_device,
+                "overlay_path": str(vm.overlay_path),
+                "api_socket": str(vm.api_socket),
+                "execd_url": vm.execd_url,
+                "is_running": vm.is_running,
+            }
         return json.dumps(info, indent=2)
 
     def get_sandbox_events(self, sandbox_id: str, limit: int = 50) -> str:
         self._get_meta(sandbox_id)
-        # Windows VMs don't have container-level events; return a stub
         return f"Events for Windows VM {sandbox_id}: (event log not available for CLH VMs)"
 
     def get_endpoint(self, sandbox_id: str, port: int, resolve_internal: bool = False) -> Endpoint:
         self.validate_port(port)
-        meta = self._get_meta(sandbox_id)
+        self._get_meta(sandbox_id)
         vm = self.vm_manager.get_vm(sandbox_id)
 
         if vm is None or not vm.is_running:
             raise HTTPException(
                 status_code=409,
                 detail={
-                    "code": WindowsErrorCodes.VM_NOT_RUNNING,
+                    "code": SandboxErrorCodes.WINDOWS_VM_NOT_RUNNING,
                     "message": f"VM {sandbox_id} is not running",
                 },
             )
 
-        # Windows VM exposes ports directly on its guest IP
-        endpoint_str = f"{vm.guest_ip}:{port}"
-
-        return Endpoint(endpoint=endpoint_str)
+        return Endpoint(endpoint=f"{vm.guest_ip}:{port}")

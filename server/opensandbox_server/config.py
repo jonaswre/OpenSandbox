@@ -651,11 +651,6 @@ class WindowsRuntimeConfig(BaseModel):
         ge=1024,
         description="Default memory in MB for Windows VMs.",
     )
-    default_disk_gb: int = Field(
-        default=64,
-        ge=30,
-        description="Default disk size in GB for Windows VM overlays.",
-    )
     network_bridge: str = Field(
         default="opensandbox-win-br0",
         description="Linux bridge name for Windows VM TAP networking.",
