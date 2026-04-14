@@ -1,0 +1,30 @@
+# OpenSandbox Windows Image Build Configuration
+#
+# Copy this file to variables.auto.pkrvars.hcl and fill in your paths:
+#   cp variables.auto.pkrvars.hcl.example variables.auto.pkrvars.hcl
+
+# Required: Path to Windows Server 2022 ISO
+windows_iso_path = "/path/to/windows-server-2022.iso"
+
+# Required: Path to VirtIO drivers ISO
+# Download from: https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/
+virtio_iso_path = "/path/to/virtio-win.iso"
+
+# Optional: Path to cross-compiled execd.exe
+# Build with: cd components/execd && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -o execd.exe ./main.go
+execd_binary_path = ""
+
+# Output directory for the built image
+output_directory = "output"
+
+# VM resources during build
+disk_size = "65536M"
+memory    = "4096"
+cpus      = 2
+
+# WinRM credentials (must match autounattend.xml)
+winrm_username = "Administrator"
+winrm_password = "OpenSandbox!"
+
+# Set to true for CI/headless builds
+headless = false

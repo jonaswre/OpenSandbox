@@ -48,6 +48,7 @@ from opensandbox_server.services.extension_service import require_extension_serv
 from opensandbox_server.services.runtime_resolver import (  # noqa: E402
     validate_secure_runtime_on_startup,
 )
+from opensandbox_server.services.clh_vm_manager import CLHVMManager  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -72,12 +73,16 @@ async def lifespan(app: FastAPI):
 
             k8s_client = K8sClient(app_config.kubernetes)
             logger.info("Validating secure runtime for Kubernetes backend")
+        elif runtime_type == "windows":
+            logger.info("Validating Windows runtime (Cloud Hypervisor)")
+            CLHVMManager.validate_on_startup(app_config.windows_runtime)
 
-        await validate_secure_runtime_on_startup(
-            app_config,
-            docker_client=docker_client,
-            k8s_client=k8s_client,
-        )
+        if runtime_type != "windows":
+            await validate_secure_runtime_on_startup(
+                app_config,
+                docker_client=docker_client,
+                k8s_client=k8s_client,
+            )
 
     except Exception as exc:
         logger.error("Secure runtime validation failed: %s", exc)

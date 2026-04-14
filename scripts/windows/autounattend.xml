@@ -1,0 +1,468 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Copyright 2025 Alibaba Group Holding Ltd.
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<!--
+  autounattend.xml - Unattended Windows Server 2022 answer file
+  for OpenSandbox base image creation (Cloud Hypervisor / OVMF).
+
+  Adapted for OpenSandbox from battle-tested runner image templates.
+
+  Key design choices:
+    - UEFI/GPT partitioning (CLH uses OVMF firmware)
+    - VirtIO SCSI disk + VirtIO network (CLH paravirtual devices)
+    - Windows Server 2022 Standard with Desktop Experience (index 2)
+    - Full unattended OOBE skip
+    - FirstLogonCommands bootstrap installs QEMU Guest Agent and
+      configures the guest for provisioning (WinRM, RDP, execd firewall
+      rule, SAC serial console).
+
+  Usage:
+    Place this file alongside a Windows Server 2022 ISO and the VirtIO
+    driver ISO when running prepare-windows-image.sh.  The Windows setup
+    engine will find autounattend.xml on the first CD-ROM or virtual
+    floppy and proceed without any user interaction.
+
+    The QEMU Guest Agent MSI is expected at:
+      <VirtIO-ISO>:\guest-agent\qemu-ga-x86_64.msi
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+
+  <!-- ===================================================================
+       PASS 1 – windowsPE
+       Runs inside the Windows PE environment before the main OS is
+       installed.  Responsible for:
+         - Selecting the setup language / locale
+         - Disk partitioning (GPT/UEFI layout)
+         - Choosing the image (edition + index) to install
+         - Accepting the EULA
+       =================================================================== -->
+  <settings pass="windowsPE">
+
+    <!-- Setup UI language and keyboard during Windows PE -->
+    <component name="Microsoft-Windows-International-Core-WinPE"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <SetupUILanguage>
+        <UILanguage>en-US</UILanguage>
+      </SetupUILanguage>
+      <InputLocale>en-US</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UILanguageFallback>en-US</UILanguageFallback>
+      <UserLocale>en-US</UserLocale>
+    </component>
+
+    <!-- Windows Setup: image selection, disk layout, EULA acceptance -->
+    <component name="Microsoft-Windows-Setup"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+
+      <!-- Select Windows Server 2022 Standard (Desktop Experience).
+           Index 2 = Standard Desktop Experience.
+           Index 1 = Standard Core (no GUI).
+           Index 3 = Datacenter Core.
+           Index 4 = Datacenter Desktop Experience. -->
+      <ImageInstall>
+        <OSImage>
+          <InstallFrom>
+            <MetaData wcm:action="add">
+              <Key>/IMAGE/INDEX</Key>
+              <Value>2</Value>
+            </MetaData>
+          </InstallFrom>
+          <InstallTo>
+            <!-- Disk 0 is the primary VirtIO SCSI disk exposed by CLH -->
+            <DiskID>0</DiskID>
+            <!-- Partition 3 is the Windows system partition (see DiskConfiguration) -->
+            <PartitionID>3</PartitionID>
+          </InstallTo>
+          <WillShowUI>Never</WillShowUI>
+        </OSImage>
+      </ImageInstall>
+
+      <!-- GPT/UEFI disk layout required for OVMF firmware used by CLH.
+           Three partitions:
+             1. EFI System Partition (ESP) – 100 MB, FAT32
+             2. Microsoft Reserved (MSR)   – 128 MB
+             3. Windows OS partition       – remaining space, NTFS       -->
+      <DiskConfiguration>
+        <Disk wcm:action="add">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+
+            <!-- Partition 1: EFI System Partition -->
+            <CreatePartition wcm:action="add">
+              <Order>1</Order>
+              <Size>100</Size>
+              <Type>EFI</Type>
+            </CreatePartition>
+
+            <!-- Partition 2: Microsoft Reserved Partition -->
+            <CreatePartition wcm:action="add">
+              <Order>2</Order>
+              <Size>128</Size>
+              <Type>MSR</Type>
+            </CreatePartition>
+
+            <!-- Partition 3: Primary Windows OS partition (all remaining space) -->
+            <CreatePartition wcm:action="add">
+              <Order>3</Order>
+              <Extend>true</Extend>
+              <Type>Primary</Type>
+            </CreatePartition>
+
+          </CreatePartitions>
+
+          <ModifyPartitions>
+
+            <!-- Format ESP as FAT32 with the correct partition label -->
+            <ModifyPartition wcm:action="add">
+              <Order>1</Order>
+              <PartitionID>1</PartitionID>
+              <Label>System</Label>
+              <Format>FAT32</Format>
+            </ModifyPartition>
+
+            <!-- MSR does not need a file system format -->
+            <ModifyPartition wcm:action="add">
+              <Order>2</Order>
+              <PartitionID>2</PartitionID>
+            </ModifyPartition>
+
+            <!-- Format OS partition as NTFS and assign drive letter C -->
+            <ModifyPartition wcm:action="add">
+              <Order>3</Order>
+              <PartitionID>3</PartitionID>
+              <Label>Windows</Label>
+              <Letter>C</Letter>
+              <Format>NTFS</Format>
+            </ModifyPartition>
+
+          </ModifyPartitions>
+        </Disk>
+      </DiskConfiguration>
+
+      <!-- Accept the Windows EULA automatically -->
+      <UserData>
+        <AcceptEula>true</AcceptEula>
+        <!-- Product key omitted; use KMS / MAK activation post-deploy.
+             For evaluation installs this field can remain empty.      -->
+        <ProductKey>
+          <WillShowUI>Never</WillShowUI>
+        </ProductKey>
+      </UserData>
+
+    </component>
+  </settings>
+
+
+  <!-- ===================================================================
+       PASS 4 – specialize
+       Runs after the OS files are copied but before the first boot.
+       Used for machine-specific configuration: computer name, locale,
+       timezone, and network settings.
+       =================================================================== -->
+  <settings pass="specialize">
+
+    <!-- System identity and time zone -->
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <!-- Base image hostname; intended to be sysprep'd or renamed post-clone -->
+      <ComputerName>SANDBOX-BASE</ComputerName>
+      <!-- UTC avoids clock skew issues in VMs and simplifies log correlation -->
+      <TimeZone>UTC</TimeZone>
+      <!-- Disable Server Manager auto-start at login for cleaner headless operation -->
+      <ServerManager>
+        <DoNotOpenServerManagerAtLogon>true</DoNotOpenServerManagerAtLogon>
+      </ServerManager>
+    </component>
+
+    <!-- System locale settings for the installed OS -->
+    <component name="Microsoft-Windows-International-Core"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <InputLocale>en-US</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UILanguageFallback>en-US</UILanguageFallback>
+      <UserLocale>en-US</UserLocale>
+    </component>
+
+    <!-- Enable RDP during specialize so it is active on first boot -->
+    <component name="Microsoft-Windows-TerminalServices-LocalSessionManager"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <fDenyTSConnections>false</fDenyTSConnections>
+    </component>
+
+    <!-- Allow RDP through the Windows Firewall -->
+    <component name="Networking-MPSSVC-Svc"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <FirewallGroups>
+        <FirewallGroup wcm:action="add" wcm:keyValue="RemoteDesktop">
+          <Active>true</Active>
+          <Group>Remote Desktop</Group>
+          <Profile>all</Profile>
+        </FirewallGroup>
+      </FirewallGroups>
+    </component>
+
+    <!-- DHCP on all adapters; CLH attaches VirtIO network devices -->
+    <component name="Microsoft-Windows-TCPIP"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <Interfaces>
+        <Interface wcm:action="add">
+          <Identifier>*</Identifier>
+          <Ipv4Settings>
+            <DhcpEnabled>true</DhcpEnabled>
+          </Ipv4Settings>
+          <Ipv6Settings>
+            <DhcpEnabled>true</DhcpEnabled>
+          </Ipv6Settings>
+        </Interface>
+      </Interfaces>
+    </component>
+
+    <!-- DHCP DNS registration for all adapters -->
+    <component name="Microsoft-Windows-DNS-Client"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+      <Interfaces>
+        <Interface wcm:action="add">
+          <Identifier>*</Identifier>
+          <DNSDomain/>
+          <EnableAdapterDomainNameRegistration>true</EnableAdapterDomainNameRegistration>
+          <DisableDynamicUpdate>false</DisableDynamicUpdate>
+        </Interface>
+      </Interfaces>
+    </component>
+
+  </settings>
+
+
+  <!-- ===================================================================
+       PASS 7 – oobeSystem
+       Runs during the Out-of-Box Experience (OOBE) phase, which is
+       completely suppressed here.  Also configures:
+         - Built-in Administrator account and password
+         - Auto-logon for the FirstLogonCommands bootstrap sequence
+         - FirstLogonCommands: the full guest agent + provisioning setup
+       =================================================================== -->
+  <settings pass="oobeSystem">
+
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35"
+               language="neutral"
+               versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+               xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+
+      <!-- Suppress all OOBE screens so the VM boots directly to the desktop -->
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <NetworkLocation>Work</NetworkLocation>
+        <ProtectYourPC>3</ProtectYourPC>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
+      </OOBE>
+
+      <!-- Built-in Administrator account.
+           NOTE: plaintext password is intentional for base template creation;
+           it MUST be rotated via provisioning before any production use.     -->
+      <UserAccounts>
+        <AdministratorPassword>
+          <Value>OpenSandbox!</Value>
+          <PlainText>true</PlainText>
+        </AdministratorPassword>
+      </UserAccounts>
+
+      <!-- Auto-logon as Administrator so FirstLogonCommands execute on first boot.
+           LogonCount=1 means auto-logon fires exactly once, then reverts to
+           normal interactive login.                                           -->
+      <AutoLogon>
+        <Enabled>true</Enabled>
+        <Username>Administrator</Username>
+        <Password>
+          <Value>OpenSandbox!</Value>
+          <PlainText>true</PlainText>
+        </Password>
+        <LogonCount>1</LogonCount>
+      </AutoLogon>
+
+      <!-- ---------------------------------------------------------------
+           FirstLogonCommands – guest bootstrap sequence.
+
+           Commands run in ascending Order after the first desktop logon.
+           Each command is a PowerShell one-liner or short script fragment
+           invoked via cmd /c powershell.exe -NoProfile -NonInteractive.
+
+           Sequence:
+             1.  Create a marker file so we can confirm bootstrap ran
+             2.  Set the network connection profile to Private
+                 (required so PS remoting and WinRM listeners bind correctly)
+             3.  Install QEMU Guest Agent from VirtIO ISO
+                 (searches all CD-ROM drives for the MSI)
+             4.  Wait for the qemu-ga service to be running
+             5.  Create C:\opensandbox working directory for execd
+             6.  Open TCP 8080 in Windows Firewall for execd
+             7.  Enable PS remoting and ensure WinRM service is running
+             8.  Configure WinRM for basic/unencrypted auth
+                 (required for Packer HTTP provisioner and simple tooling)
+             9.  Enable SAC (Special Administration Console) via bcdedit
+                 for out-of-band serial console access
+             10. Schedule an immediate restart to finalize driver bindings
+           --------------------------------------------------------------- -->
+      <FirstLogonCommands>
+
+        <!-- Step 1: Marker file – confirms bootstrap script reached this point -->
+        <SynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Description>Create bootstrap marker file</Description>
+          <CommandLine>cmd /c echo Bootstrap started > C:\bootstrap.log</CommandLine>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- Step 2: Set network profile to Private so WinRM listeners bind -->
+        <SynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Description>Set network profile to Private</Description>
+          <CommandLine>cmd /c powershell.exe -NoProfile -NonInteractive -Command "Get-NetConnectionProfile | Set-NetConnectionProfile -NetworkCategory Private"</CommandLine>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- Step 3: Install QEMU Guest Agent from the VirtIO ISO.
+             Iterates over all CD-ROM drives looking for the MSI. -->
+        <SynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Description>Install QEMU Guest Agent from VirtIO ISO</Description>
+          <CommandLine>cmd /c powershell.exe -NoProfile -NonInteractive -Command "$ga = Get-WmiObject Win32_CDROMDrive | ForEach-Object { $msi = $_.Drive + '\guest-agent\qemu-ga-x86_64.msi'; if (Test-Path $msi) { $msi } } | Select-Object -First 1; if ($ga) { Start-Process msiexec.exe -ArgumentList '/i',$ga,'/qn','/norestart' -Wait; 'QEMU-GA installed: ' + $ga | Out-File -Append C:\bootstrap.log } else { 'QEMU-GA MSI not found on any CD-ROM' | Out-File -Append C:\bootstrap.log }"</CommandLine>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- Step 4: Wait for the qemu-ga service to enter Running state -->
+        <SynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <Description>Wait for QEMU Guest Agent service</Description>
+          <CommandLine>cmd /c powershell.exe -NoProfile -NonInteractive -Command "$timeout = 60; $elapsed = 0; while ($elapsed -lt $timeout) { $svc = Get-Service -Name 'QEMU-GA' -ErrorAction SilentlyContinue; if ($svc -and $svc.Status -eq 'Running') { 'QEMU-GA running' | Out-File -Append C:\bootstrap.log; break }; Start-Sleep -Seconds 2; $elapsed += 2 }"</CommandLine>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- Step 5: Create the OpenSandbox working directory for execd -->
+        <SynchronousCommand wcm:action="add">
+          <Order>5</Order>
+          <Description>Create C:\opensandbox directory</Description>
+          <CommandLine>cmd /c powershell.exe -NoProfile -NonInteractive -Command "New-Item -ItemType Directory -Force -Path 'C:\opensandbox' | Out-Null; 'C:\opensandbox created' | Out-File -Append C:\bootstrap.log"</CommandLine>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- Step 6: Open TCP 8080 in Windows Firewall for the execd HTTP listener -->
+        <SynchronousCommand wcm:action="add">
+          <Order>6</Order>
+          <Description>Open firewall port 8080 for execd</Description>
+          <CommandLine>cmd /c powershell.exe -NoProfile -NonInteractive -Command "New-NetFirewallRule -DisplayName 'OpenSandbox execd' -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow -Profile Any | Out-Null; 'Firewall rule for port 8080 added' | Out-File -Append C:\bootstrap.log"</CommandLine>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- Step 7: Enable PowerShell Remoting and ensure WinRM is running.
+             Enable-PSRemoting creates the WinRM listener and sets the
+             required firewall rules in a single call. -->
+        <SynchronousCommand wcm:action="add">
+          <Order>7</Order>
+          <Description>Enable PowerShell remoting and WinRM</Description>
+          <CommandLine>cmd /c powershell.exe -NoProfile -NonInteractive -Command "Enable-PSRemoting -Force -SkipNetworkProfileCheck; Set-Service -Name WinRM -StartupType Automatic; Start-Service WinRM; 'WinRM enabled' | Out-File -Append C:\bootstrap.log"</CommandLine>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- Step 8: Configure WinRM for basic auth and unencrypted transport.
+             Required for Packer winrm communicator and simple provisioning
+             tools that do not support Kerberos/NTLM or HTTPS.
+             WARNING: Only use on trusted/isolated networks.                  -->
+        <SynchronousCommand wcm:action="add">
+          <Order>8</Order>
+          <Description>Configure WinRM basic auth and unencrypted transport</Description>
+          <CommandLine>cmd /c powershell.exe -NoProfile -NonInteractive -Command "winrm set winrm/config/service '@{AllowUnencrypted=""true""}'; winrm set winrm/config/service/auth '@{Basic=""true""}'; winrm set winrm/config/client/auth '@{Basic=""true""}'; winrm set winrm/config/winrs '@{MaxMemoryPerShellMB=""1024""}'; 'WinRM basic auth configured' | Out-File -Append C:\bootstrap.log"</CommandLine>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- Step 9: Enable SAC (Special Administration Console) for serial access.
+             SAC provides an out-of-band console over the CLH serial port (COM1)
+             which is invaluable for debugging headless VMs that cannot boot.
+             emssettings maps SAC to COM1 at 115200 baud.                       -->
+        <SynchronousCommand wcm:action="add">
+          <Order>9</Order>
+          <Description>Enable SAC serial console via bcdedit</Description>
+          <CommandLine>cmd /c bcdedit /ems {default} on &amp;&amp; bcdedit /emssettings emsport:1 emsbaudrate:115200 &amp;&amp; sc config sacsvr start= auto &amp;&amp; net start sacsvr &amp;&amp; echo SAC enabled >> C:\bootstrap.log</CommandLine>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+        <!-- Step 10: Restart to finalize VirtIO driver bindings and apply SAC config.
+              The shutdown command schedules a reboot in 5 seconds, giving the
+              current logon session time to flush disk writes.                  -->
+        <SynchronousCommand wcm:action="add">
+          <Order>10</Order>
+          <Description>Restart to finalize driver bindings</Description>
+          <CommandLine>cmd /c echo Bootstrap complete >> C:\bootstrap.log &amp;&amp; shutdown /r /t 5 /c "OpenSandbox base image bootstrap complete - rebooting to finalize driver bindings"</CommandLine>
+          <RequiresUserInput>false</RequiresUserInput>
+        </SynchronousCommand>
+
+      </FirstLogonCommands>
+
+    </component>
+
+  </settings>
+
+</unattend>

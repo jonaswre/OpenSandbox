@@ -499,16 +499,15 @@ class EgressConfig(BaseModel):
 
 
 class RuntimeConfig(BaseModel):
-    """Runtime selection (docker, kubernetes, etc.)."""
+    """Runtime selection (docker, kubernetes, windows, etc.)."""
 
-    type: Literal["docker", "kubernetes"] = Field(
+    type: Literal["docker", "kubernetes", "windows"] = Field(
         ...,
         description="Active sandbox runtime implementation.",
     )
     execd_image: str = Field(
-        ...,
+        default="",
         description="Container image that contains the execd binary for sandbox initialization.",
-        min_length=1,
     )
 
 
@@ -626,6 +625,62 @@ class DockerConfig(BaseModel):
     )
 
 
+class WindowsRuntimeConfig(BaseModel):
+    """Windows guest support via Cloud Hypervisor (CLH)."""
+
+    clh_binary: str = Field(
+        default="/usr/local/bin/cloud-hypervisor",
+        description="Path to the cloud-hypervisor binary.",
+    )
+    firmware: str = Field(
+        default="/usr/share/cloud-hypervisor/CLOUDHV.fd",
+        description="Path to CLOUDHV.fd UEFI firmware (CLH-specific OVMF build).",
+    )
+    image_dir: str = Field(
+        default="/var/lib/opensandbox/windows-images",
+        description="Directory containing Windows base images (.qcow2 or .raw).",
+    )
+    default_cpus: int = Field(
+        default=2,
+        ge=1,
+        le=64,
+        description="Default vCPU count for Windows VMs.",
+    )
+    default_memory_mb: int = Field(
+        default=4096,
+        ge=1024,
+        description="Default memory in MB for Windows VMs.",
+    )
+    default_disk_gb: int = Field(
+        default=64,
+        ge=30,
+        description="Default disk size in GB for Windows VM overlays.",
+    )
+    network_bridge: str = Field(
+        default="opensandbox-win-br0",
+        description="Linux bridge name for Windows VM TAP networking.",
+    )
+    api_socket_dir: str = Field(
+        default="/run/opensandbox/clh",
+        description="Directory for per-VM CLH API sockets.",
+    )
+    hyperv_enlightenments: bool = Field(
+        default=True,
+        description="Enable Hyper-V enlightenments for better Windows performance.",
+    )
+    execd_port: int = Field(
+        default=8080,
+        ge=1,
+        le=65535,
+        description="Port that execd listens on inside the Windows guest.",
+    )
+    boot_timeout_seconds: int = Field(
+        default=120,
+        ge=30,
+        description="Maximum seconds to wait for Windows VM boot and execd readiness.",
+    )
+
+
 class AppConfig(BaseModel):
     """Root application configuration model."""
 
@@ -648,6 +703,10 @@ class AppConfig(BaseModel):
     secure_runtime: Optional[SecureRuntimeConfig] = Field(
         default=None,
         description="Secure container runtime configuration (gVisor, Kata, Firecracker).",
+    )
+    windows_runtime: Optional[WindowsRuntimeConfig] = Field(
+        default=None,
+        description="Windows guest support via Cloud Hypervisor.",
     )
 
     @model_validator(mode="after")
@@ -672,6 +731,13 @@ class AppConfig(BaseModel):
                 raise ValueError(
                     "agent_sandbox block requires kubernetes.workload_provider = 'agent-sandbox'."
                 )
+        elif self.runtime.type == "windows":
+            if self.windows_runtime is None:
+                self.windows_runtime = WindowsRuntimeConfig()
+            if self.kubernetes is not None:
+                raise ValueError("Kubernetes block must be omitted when runtime.type = 'windows'.")
+            if self.secure_runtime is not None and self.secure_runtime.type != "":
+                raise ValueError("secure_runtime is not used with runtime.type = 'windows' (CLH provides VM isolation).")
         else:
             raise ValueError(f"Unsupported runtime type '{self.runtime.type}'.")
         return self

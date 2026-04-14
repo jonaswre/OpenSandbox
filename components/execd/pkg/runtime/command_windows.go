@@ -31,6 +31,34 @@ import (
 	"github.com/alibaba/opensandbox/internal/safego"
 )
 
+// getShell returns the preferred Windows shell.
+// It checks for PowerShell Core (pwsh.exe) first, then Windows PowerShell
+// (powershell.exe), and falls back to cmd if neither is found.
+func getShell() string {
+	if _, err := exec.LookPath("pwsh.exe"); err == nil {
+		return "pwsh.exe"
+	}
+	if _, err := exec.LookPath("powershell.exe"); err == nil {
+		return "powershell.exe"
+	}
+	return "cmd"
+}
+
+// buildCredential is a no-op stub on Windows; POSIX uid/gid are not applicable.
+func buildCredential(uid, gid *uint32) (interface{}, error) { //nolint:nilnil
+	return nil, nil
+}
+
+// shellArgs returns the argument list to execute code in the given shell.
+func shellArgs(shell, code string) []string {
+	switch shell {
+	case "pwsh.exe", "powershell.exe":
+		return []string{"-NoProfile", "-NonInteractive", "-Command", code}
+	default:
+		return []string{"/C", code}
+	}
+}
+
 // runCommand executes shell commands and streams their output on Windows.
 func (c *Controller) runCommand(ctx context.Context, request *ExecuteCodeRequest) error {
 	session := c.newContextID()
@@ -43,7 +71,9 @@ func (c *Controller) runCommand(ctx context.Context, request *ExecuteCodeRequest
 
 	startAt := time.Now()
 	log.Info("received command: %v", request.Code)
-	cmd := exec.CommandContext(ctx, "cmd", "/C", request.Code)
+	shell := getShell()
+	args := shellArgs(shell, request.Code)
+	cmd := exec.CommandContext(ctx, shell, args...)
 
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
@@ -117,7 +147,9 @@ func (c *Controller) runBackgroundCommand(ctx context.Context, cancel context.Ca
 
 	startAt := time.Now()
 	log.Info("received command: %v", request.Code)
-	cmd := exec.CommandContext(ctx, "cmd", "/C", request.Code)
+	shell := getShell()
+	args := shellArgs(shell, request.Code)
+	cmd := exec.CommandContext(ctx, shell, args...)
 
 	cmd.Dir = request.Cwd
 	cmd.Stdout = pipe

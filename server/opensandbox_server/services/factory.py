@@ -26,6 +26,7 @@ from opensandbox_server.config import AppConfig, get_config
 from opensandbox_server.services.docker import DockerSandboxService
 from opensandbox_server.services.k8s import KubernetesSandboxService
 from opensandbox_server.services.sandbox_service import SandboxService
+from opensandbox_server.services.windows import WindowsSandboxService
 
 logger = logging.getLogger(__name__)
 
@@ -57,8 +58,7 @@ def create_sandbox_service(
     implementations: dict[str, type[SandboxService]] = {
         "docker": DockerSandboxService,
         "kubernetes": KubernetesSandboxService,
-        # Future implementations can be added here:
-        # "containerd": ContainerdSandboxService,
+        "windows": WindowsSandboxService,
     }
 
     if selected_type not in implementations:
