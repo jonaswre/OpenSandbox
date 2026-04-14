@@ -18,7 +18,6 @@
 package runtime
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -32,7 +31,6 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/alibaba/opensandbox/execd/pkg/jupyter/execute"
 	"github.com/alibaba/opensandbox/execd/pkg/log"
 )
 
@@ -150,163 +148,55 @@ func (s *bashSession) untrackCurrentProcess() {
 	s.currentProcessPid = 0
 }
 
-//nolint:gocognit
-func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) error {
+// lockAndGetState implements sessionState for bashSession.
+func (s *bashSession) lockAndGetState() (map[string]string, string, string, error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.started {
-		s.mu.Unlock()
-		return errors.New("session not started")
+		return nil, "", "", errors.New("session not started")
 	}
+	return copyEnvMap(s.env), s.cwd, s.config.Session, nil
+}
 
-	envSnapshot := copyEnvMap(s.env)
+// trackProcess implements sessionState for bashSession.
+func (s *bashSession) trackProcess(pid int) {
+	s.trackCurrentProcess(pid)
+}
 
-	cwd := s.cwd
-	// override original cwd if specified
-	if request.Cwd != "" {
-		cwd = request.Cwd
-	}
-	sessionID := s.config.Session
-	s.mu.Unlock()
+// untrackProcess implements sessionState for bashSession.
+func (s *bashSession) untrackProcess() {
+	s.untrackCurrentProcess()
+}
 
-	startAt := time.Now()
-	if request.Hooks.OnExecuteInit != nil {
-		request.Hooks.OnExecuteInit(sessionID)
-	}
-
-	wait := request.Timeout
-	if wait <= 0 {
-		wait = 24 * 3600 * time.Second // max to 24 hours
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, wait)
-	defer cancel()
-
-	script := buildWrappedScript(request.Code, envSnapshot, cwd)
-	scriptFile, err := os.CreateTemp("", "execd_bash_*.sh")
-	if err != nil {
-		return fmt.Errorf("create script file: %w", err)
-	}
-	scriptPath := scriptFile.Name()
-	if _, err := scriptFile.WriteString(script); err != nil {
-		_ = scriptFile.Close()
-		return fmt.Errorf("write script file: %w", err)
-	}
-	if err := scriptFile.Close(); err != nil {
-		return fmt.Errorf("close script file: %w", err)
-	}
-
-	cmd := exec.CommandContext(ctx, "bash", "--noprofile", "--norc", scriptPath)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	// Do not pass envSnapshot via cmd.Env to avoid "argument list too long" when session env is large.
-	// Child inherits parent env (nil => default in Go). The script file already has "export K=V" for
-	// all session vars at the top, so the session environment is applied when the script runs.
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("stdout pipe: %w", err)
-	}
-	cmd.Stderr = cmd.Stdout
-
-	if err := cmd.Start(); err != nil {
-		log.Error("start bash session failed: %v (command: %q)", err, request.Code)
-		return fmt.Errorf("start bash: %w", err)
-	}
-	defer s.untrackCurrentProcess()
-	s.trackCurrentProcess(cmd.Process.Pid)
-
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-
-	var (
-		envLines []string
-		pwdLine  string
-		exitCode *int
-		inEnv    bool
-	)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		switch {
-		case line == envDumpStartMarker:
-			inEnv = true
-		case line == envDumpEndMarker:
-			inEnv = false
-		case strings.HasPrefix(line, exitMarkerPrefix):
-			if code, err := strconv.Atoi(strings.TrimPrefix(line, exitMarkerPrefix)); err == nil {
-				exitCode = &code //nolint:ineffassign
-			}
-		case strings.HasPrefix(line, pwdMarkerPrefix):
-			pwdLine = strings.TrimPrefix(line, pwdMarkerPrefix)
-		default:
-			if inEnv {
-				envLines = append(envLines, line)
-				continue
-			}
-			if request.Hooks.OnExecuteStdout != nil {
-				request.Hooks.OnExecuteStdout(line)
-			}
-		}
-	}
-
-	scanErr := scanner.Err()
-	waitErr := cmd.Wait()
-
-	if scanErr != nil {
-		log.Error("read stdout failed: %v (command: %q)", scanErr, request.Code)
-		return fmt.Errorf("read stdout: %w", scanErr)
-	}
-
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		log.Error("timeout after %s while running command: %q", wait, request.Code)
-		return fmt.Errorf("timeout after %s while running command %q", wait, request.Code)
-	}
-
-	if exitCode == nil && cmd.ProcessState != nil {
-		code := cmd.ProcessState.ExitCode() //nolint:staticcheck
-		exitCode = &code                    //nolint:ineffassign
-	}
-
-	updatedEnv := parseExportDump(envLines)
+// updateEnvAndCwd implements sessionState for bashSession.
+func (s *bashSession) updateEnvAndCwd(env map[string]string, cwd string) {
 	s.mu.Lock()
-	if len(updatedEnv) > 0 {
-		s.env = updatedEnv
+	defer s.mu.Unlock()
+	if len(env) > 0 {
+		s.env = env
 	}
-	if pwdLine != "" {
-		s.cwd = pwdLine
+	if cwd != "" {
+		s.cwd = cwd
 	}
-	s.mu.Unlock()
+}
 
-	var exitErr *exec.ExitError
-	if waitErr != nil && !errors.As(waitErr, &exitErr) {
-		log.Error("command wait failed: %v (command: %q)", waitErr, request.Code)
-		return waitErr
+func (s *bashSession) run(ctx context.Context, request *ExecuteCodeRequest) error {
+	cfg := sessionRunConfig{
+		markers: markerSet{
+			envDumpStart: envDumpStartMarker,
+			envDumpEnd:   envDumpEndMarker,
+			exitPrefix:   exitMarkerPrefix,
+			pwdPrefix:    pwdMarkerPrefix,
+		},
+		buildScript: buildWrappedScript,
+		parseEnv:    parseExportDump,
+		buildCmd: func(ctx context.Context, scriptPath string) *exec.Cmd {
+			cmd := exec.CommandContext(ctx, "bash", "--noprofile", "--norc", scriptPath)
+			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			return cmd
+		},
 	}
-
-	userExitCode := 0
-	if exitCode != nil {
-		userExitCode = *exitCode
-	}
-
-	if userExitCode != 0 {
-		errMsg := fmt.Sprintf("command exited with code %d", userExitCode)
-		if waitErr != nil {
-			errMsg = waitErr.Error()
-		}
-		if request.Hooks.OnExecuteError != nil {
-			request.Hooks.OnExecuteError(&execute.ErrorOutput{
-				EName:     "CommandExecError",
-				EValue:    strconv.Itoa(userExitCode),
-				Traceback: []string{errMsg},
-			})
-		}
-		log.Error("CommandExecError: %s (command: %q)", errMsg, request.Code)
-		return nil
-	}
-
-	if request.Hooks.OnExecuteComplete != nil {
-		request.Hooks.OnExecuteComplete(time.Since(startAt))
-	}
-
-	return nil
+	return runSessionScript(ctx, request, s, cfg)
 }
 
 func buildWrappedScript(command string, env map[string]string, cwd string) string {

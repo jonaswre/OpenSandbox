@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/alibaba/opensandbox/execd/pkg/jupyter/execute"
@@ -31,17 +32,25 @@ import (
 	"github.com/alibaba/opensandbox/internal/safego"
 )
 
-// getShell returns the preferred Windows shell.
+var (
+	shellOnce sync.Once
+	shellName string
+)
+
+// getShell returns the preferred Windows shell (cached after first call).
 // It checks for PowerShell Core (pwsh.exe) first, then Windows PowerShell
 // (powershell.exe), and falls back to cmd if neither is found.
 func getShell() string {
-	if _, err := exec.LookPath("pwsh.exe"); err == nil {
-		return "pwsh.exe"
-	}
-	if _, err := exec.LookPath("powershell.exe"); err == nil {
-		return "powershell.exe"
-	}
-	return "cmd"
+	shellOnce.Do(func() {
+		if _, err := exec.LookPath("pwsh.exe"); err == nil {
+			shellName = "pwsh.exe"
+		} else if _, err := exec.LookPath("powershell.exe"); err == nil {
+			shellName = "powershell.exe"
+		} else {
+			shellName = "cmd"
+		}
+	})
+	return shellName
 }
 
 // buildCredential is a no-op stub on Windows; POSIX uid/gid are not applicable.

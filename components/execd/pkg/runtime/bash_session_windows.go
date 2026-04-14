@@ -18,20 +18,16 @@
 package runtime
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
-	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/google/uuid"
 
-	"github.com/alibaba/opensandbox/execd/pkg/jupyter/execute"
 	"github.com/alibaba/opensandbox/execd/pkg/log"
 )
 
@@ -97,166 +93,62 @@ func (s *powershellSession) untrackCurrentProcess() {
 	s.currentProcessPid = 0
 }
 
-//nolint:gocognit
-func (s *powershellSession) run(ctx context.Context, request *ExecuteCodeRequest) error {
+// lockAndGetState implements sessionState for powershellSession.
+func (s *powershellSession) lockAndGetState() (map[string]string, string, string, error) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if !s.started {
-		s.mu.Unlock()
-		return errors.New("session not started")
+		return nil, "", "", errors.New("session not started")
 	}
+	return copyEnvMap(s.env), s.cwd, s.sessionID, nil
+}
 
-	envSnapshot := copyEnvMap(s.env)
-	cwd := s.cwd
-	if request.Cwd != "" {
-		cwd = request.Cwd
-	}
-	sessionID := s.sessionID
-	s.mu.Unlock()
+// trackProcess implements sessionState for powershellSession.
+func (s *powershellSession) trackProcess(pid int) {
+	s.trackCurrentProcess(pid)
+}
 
-	startAt := time.Now()
-	if request.Hooks.OnExecuteInit != nil {
-		request.Hooks.OnExecuteInit(sessionID)
-	}
+// untrackProcess implements sessionState for powershellSession.
+func (s *powershellSession) untrackProcess() {
+	s.untrackCurrentProcess()
+}
 
-	wait := request.Timeout
-	if wait <= 0 {
-		wait = 24 * 3600 * time.Second
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, wait)
-	defer cancel()
-
-	script := buildWrappedPSScript(request.Code, envSnapshot, cwd)
-	scriptFile, err := os.CreateTemp("", "execd_ps_*.ps1")
-	if err != nil {
-		return fmt.Errorf("create script file: %w", err)
-	}
-	scriptPath := scriptFile.Name()
-	if _, err := scriptFile.WriteString(script); err != nil {
-		_ = scriptFile.Close()
-		_ = os.Remove(scriptPath)
-		return fmt.Errorf("write script file: %w", err)
-	}
-	if err := scriptFile.Close(); err != nil {
-		_ = os.Remove(scriptPath)
-		return fmt.Errorf("close script file: %w", err)
-	}
-	defer func() { _ = os.Remove(scriptPath) }()
-
-	// Use getShell() for consistency with command execution (prefers pwsh over powershell).
-	shell := getShell()
-	cmd := exec.CommandContext(ctx, shell,
-		"-NoProfile",
-		"-NonInteractive",
-		"-ExecutionPolicy", "Bypass",
-		"-File", scriptPath,
-	)
-
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return fmt.Errorf("stdout pipe: %w", err)
-	}
-	cmd.Stderr = cmd.Stdout
-
-	if err := cmd.Start(); err != nil {
-		log.Error("start powershell session failed: %v (command: %q)", err, request.Code)
-		return fmt.Errorf("start powershell: %w", err)
-	}
-	defer s.untrackCurrentProcess()
-	s.trackCurrentProcess(cmd.Process.Pid)
-
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-
-	var (
-		envLines []string
-		pwdLine  string
-		exitCode *int
-		inEnv    bool
-	)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		switch {
-		case line == psEnvDumpStartMarker:
-			inEnv = true
-		case line == psEnvDumpEndMarker:
-			inEnv = false
-		case strings.HasPrefix(line, psExitMarkerPrefix):
-			if code, err := strconv.Atoi(strings.TrimPrefix(line, psExitMarkerPrefix)); err == nil {
-				exitCode = &code			}
-		case strings.HasPrefix(line, psPwdMarkerPrefix):
-			pwdLine = strings.TrimPrefix(line, psPwdMarkerPrefix)
-		default:
-			if inEnv {
-				envLines = append(envLines, line)
-				continue
-			}
-			if request.Hooks.OnExecuteStdout != nil {
-				request.Hooks.OnExecuteStdout(line)
-			}
-		}
-	}
-
-	scanErr := scanner.Err()
-	waitErr := cmd.Wait()
-
-	if scanErr != nil {
-		log.Error("read stdout failed: %v (command: %q)", scanErr, request.Code)
-		return fmt.Errorf("read stdout: %w", scanErr)
-	}
-
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		log.Error("timeout after %s while running command: %q", wait, request.Code)
-		return fmt.Errorf("timeout after %s while running command %q", wait, request.Code)
-	}
-
-	if exitCode == nil && cmd.ProcessState != nil {
-		code := cmd.ProcessState.ExitCode() //nolint:staticcheck
-		exitCode = &code                   	}
-
-	updatedEnv := parsePSEnvDump(envLines)
+// updateEnvAndCwd implements sessionState for powershellSession.
+func (s *powershellSession) updateEnvAndCwd(env map[string]string, cwd string) {
 	s.mu.Lock()
-	if len(updatedEnv) > 0 {
-		s.env = updatedEnv
+	defer s.mu.Unlock()
+	if len(env) > 0 {
+		s.env = env
 	}
-	if pwdLine != "" {
-		s.cwd = pwdLine
+	if cwd != "" {
+		s.cwd = cwd
 	}
-	s.mu.Unlock()
+}
 
-	var exitErr *exec.ExitError
-	if waitErr != nil && !errors.As(waitErr, &exitErr) {
-		log.Error("command wait failed: %v (command: %q)", waitErr, request.Code)
-		return waitErr
+func (s *powershellSession) run(ctx context.Context, request *ExecuteCodeRequest) error {
+	cfg := sessionRunConfig{
+		markers: markerSet{
+			envDumpStart: psEnvDumpStartMarker,
+			envDumpEnd:   psEnvDumpEndMarker,
+			exitPrefix:   psExitMarkerPrefix,
+			pwdPrefix:    psPwdMarkerPrefix,
+		},
+		buildScript: buildWrappedPSScript,
+		parseEnv:    parsePSEnvDump,
+		buildCmdFromScript: func(ctx context.Context, script string) *exec.Cmd {
+			// Use getShell() for consistency with command execution (prefers pwsh over powershell).
+			shell := getShell()
+			cmd := exec.CommandContext(ctx, shell,
+				"-NoProfile",
+				"-NonInteractive",
+				"-ExecutionPolicy", "Bypass",
+				"-Command", "-",
+			)
+			cmd.Stdin = strings.NewReader(script)
+			return cmd
+		},
 	}
-
-	userExitCode := 0
-	if exitCode != nil {
-		userExitCode = *exitCode
-	}
-
-	if userExitCode != 0 {
-		errMsg := fmt.Sprintf("command exited with code %d", userExitCode)
-		if waitErr != nil {
-			errMsg = waitErr.Error()
-		}
-		if request.Hooks.OnExecuteError != nil {
-			request.Hooks.OnExecuteError(&execute.ErrorOutput{
-				EName:     "CommandExecError",
-				EValue:    strconv.Itoa(userExitCode),
-				Traceback: []string{errMsg},
-			})
-		}
-		log.Error("CommandExecError: %s (command: %q)", errMsg, request.Code)
-		return nil
-	}
-
-	if request.Hooks.OnExecuteComplete != nil {
-		request.Hooks.OnExecuteComplete(time.Since(startAt))
-	}
-
-	return nil
+	return runSessionScript(ctx, request, s, cfg)
 }
 
 func (s *powershellSession) close() error {

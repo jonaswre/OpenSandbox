@@ -52,7 +52,7 @@ from opensandbox_server.services.constants import (
 )
 from opensandbox_server.services.endpoint_auth import generate_egress_token
 from opensandbox_server.services.endpoint_auth import build_egress_auth_headers, merge_endpoint_headers
-from opensandbox_server.services.helpers import matches_filter
+from opensandbox_server.services.helpers import matches_filter, paginate_list
 from opensandbox_server.services.extension_service import ExtensionService
 from opensandbox_server.services.k8s.k8s_diagnostics import K8sDiagnosticsMixin
 from opensandbox_server.services.sandbox_service import SandboxService
@@ -522,26 +522,11 @@ class KubernetesSandboxService(K8sDiagnosticsMixin, SandboxService, ExtensionSer
             filtered.sort(key=lambda s: s.created_at or datetime.min, reverse=True)
             
             # Apply pagination
-            total_items = len(filtered)
-            page = request.pagination.page
-            page_size = request.pagination.page_size
-            
-            start_idx = (page - 1) * page_size
-            end_idx = start_idx + page_size
-            paginated_items = filtered[start_idx:end_idx]
-            
-            total_pages = (total_items + page_size - 1) // page_size
-            has_next = page < total_pages
-            
+            paginated_items, pagination_info = paginate_list(filtered, request.pagination)
+
             return ListSandboxesResponse(
                 items=paginated_items,
-                pagination=PaginationInfo(
-                    page=page,
-                    page_size=page_size,
-                    total_items=total_items,
-                    total_pages=total_pages,
-                    has_next_page=has_next,
-                ),
+                pagination=pagination_info,
             )
             
         except Exception as e:

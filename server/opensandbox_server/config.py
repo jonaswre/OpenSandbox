@@ -634,7 +634,19 @@ class WindowsRuntimeConfig(BaseModel):
     )
     firmware: str = Field(
         default="/usr/share/cloud-hypervisor/CLOUDHV.fd",
-        description="Path to CLOUDHV.fd UEFI firmware (CLH-specific OVMF build).",
+        description="Path to CLOUDHV.fd UEFI firmware (CLH-specific OVMF build). Ignored when kernel is set.",
+    )
+    kernel: Optional[str] = Field(
+        default=None,
+        description="Path to Linux kernel (vmlinuz) for direct kernel boot. Overrides firmware.",
+    )
+    initrd: Optional[str] = Field(
+        default=None,
+        description="Path to initrd/initramfs for direct kernel boot.",
+    )
+    cmdline: Optional[str] = Field(
+        default=None,
+        description="Kernel command line for direct kernel boot.",
     )
     image_dir: str = Field(
         default="/var/lib/opensandbox/windows-images",
@@ -652,7 +664,7 @@ class WindowsRuntimeConfig(BaseModel):
         description="Default memory in MB for Windows VMs.",
     )
     network_bridge: str = Field(
-        default="opensandbox-win-br0",
+        default="osbr0",
         description="Linux bridge name for Windows VM TAP networking.",
     )
     api_socket_dir: str = Field(
@@ -838,6 +850,7 @@ __all__ = [
     "EGRESS_MODE_DNS",
     "EGRESS_MODE_DNS_NFT",
     "SecureRuntimeConfig",
+    "WindowsRuntimeConfig",
     "DEFAULT_CONFIG_PATH",
     "CONFIG_ENV_VAR",
     "get_config",

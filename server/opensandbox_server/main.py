@@ -48,7 +48,6 @@ from opensandbox_server.services.extension_service import require_extension_serv
 from opensandbox_server.services.runtime_resolver import (  # noqa: E402
     validate_secure_runtime_on_startup,
 )
-from opensandbox_server.services.clh_vm_manager import CLHVMManager  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +73,8 @@ async def lifespan(app: FastAPI):
             k8s_client = K8sClient(app_config.kubernetes)
             logger.info("Validating secure runtime for Kubernetes backend")
         elif runtime_type == "windows":
+            from opensandbox_server.services.clh_vm_manager import CLHVMManager  # noqa: E402
+
             logger.info("Validating Windows runtime (Cloud Hypervisor)")
             CLHVMManager.validate_on_startup(app_config.windows_runtime)
 
@@ -102,6 +103,18 @@ async def lifespan(app: FastAPI):
     )
 
     yield
+
+    # Shutdown: clean up Windows VM resources if applicable
+    if runtime_type == "windows":
+        from opensandbox_server.services.windows import WindowsSandboxService
+
+        if isinstance(sandbox_service, WindowsSandboxService):
+            for vm_id in list(sandbox_service.vm_manager.vms):
+                try:
+                    await sandbox_service.vm_manager.destroy_vm(vm_id)
+                except Exception:
+                    logger.warning("Failed to destroy VM %s during shutdown", vm_id)
+            await sandbox_service.vm_manager.close()
 
     consumer = getattr(app.state, "renew_intent_consumer", None)
     if consumer is not None:

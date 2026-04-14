@@ -19,27 +19,6 @@ import "strings"
 // maxPersistedEnvValueSize caps single env value length as a safeguard.
 const maxPersistedEnvValueSize = 8 * 1024
 
-// isValidEnvKey checks that key is a valid POSIX-style environment variable name.
-func isValidEnvKey(key string) bool {
-	if key == "" {
-		return false
-	}
-
-	for i, r := range key {
-		if i == 0 {
-			if (r < 'A' || (r > 'Z' && r < 'a') || r > 'z') && r != '_' {
-				return false
-			}
-			continue
-		}
-		if (r < 'A' || (r > 'Z' && r < 'a') || r > 'z') && (r < '0' || r > '9') && r != '_' {
-			return false
-		}
-	}
-
-	return true
-}
-
 // copyEnvMap returns a shallow copy of a string map.
 func copyEnvMap(src map[string]string) map[string]string {
 	if src == nil {

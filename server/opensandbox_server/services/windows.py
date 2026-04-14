@@ -21,6 +21,7 @@ pre-installed as a Windows service.
 """
 
 import asyncio
+import enum
 import json
 import logging
 import math
@@ -47,10 +48,24 @@ from opensandbox_server.api.schema import (
 from opensandbox_server.config import AppConfig, get_config
 from opensandbox_server.services.clh_vm_manager import CLHVMManager
 from opensandbox_server.services.constants import SandboxErrorCodes
-from opensandbox_server.services.helpers import matches_filter, parse_memory_limit, parse_nano_cpus
+from opensandbox_server.services.helpers import matches_filter, paginate_list, parse_memory_limit, parse_nano_cpus
+from opensandbox_server.services.extension_service import ExtensionService
 from opensandbox_server.services.sandbox_service import SandboxService
+from opensandbox_server.services.validators import (
+    calculate_expiration_or_raise,
+    ensure_future_expiration,
+    ensure_timeout_within_limit,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class VMState(str, enum.Enum):
+    """Lifecycle states for a Windows VM sandbox."""
+
+    RUNNING = "Running"
+    PAUSED = "Paused"
+    TERMINATED = "Terminated"
 
 
 class _SandboxMeta:
@@ -77,13 +92,13 @@ class _SandboxMeta:
         self.entrypoint = entrypoint
         self.metadata = metadata
         self.platform = platform
-        self.status = "Running"
+        self.status: VMState = VMState.RUNNING
         self.created_at = created_at
         self.expires_at = expires_at
         self.expiration_timer: Optional[threading.Timer] = None
 
 
-class WindowsSandboxService(SandboxService):
+class WindowsSandboxService(SandboxService, ExtensionService):
     """SandboxService implementation for Windows guests via Cloud Hypervisor."""
 
     def __init__(self, config: Optional[AppConfig] = None):
@@ -97,24 +112,14 @@ class WindowsSandboxService(SandboxService):
         self._meta: dict[str, _SandboxMeta] = {}
         self._lock = threading.Lock()
         self._max_timeout = self.app_config.server.max_sandbox_timeout_seconds
+        self._event_loop: Optional[asyncio.AbstractEventLoop] = None
 
-    # ------------------------------------------------------------------
-    # Async bridge — awaits the coroutine from sync context
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _run_async(coro):
-        """Run an async coroutine from a sync method, handling both cases."""
+    def _capture_event_loop(self):
+        """Capture the running event loop for use by timer callbacks."""
         try:
-            loop = asyncio.get_running_loop()
+            self._event_loop = asyncio.get_running_loop()
         except RuntimeError:
-            loop = None
-
-        if loop and loop.is_running():
-            future = asyncio.run_coroutine_threadsafe(coro, loop)
-            return future.result(timeout=60)
-        else:
-            return asyncio.run(coro)
+            pass
 
     # ------------------------------------------------------------------
     # Helpers
@@ -135,7 +140,7 @@ class WindowsSandboxService(SandboxService):
             id=meta.sandbox_id,
             image=ImageSpec(uri=meta.image_uri),
             platform=meta.platform,
-            status=SandboxStatus(state=meta.status),
+            status=SandboxStatus(state=meta.status.value),
             metadata=meta.metadata,
             entrypoint=meta.entrypoint,
             expires_at=meta.expires_at,
@@ -153,7 +158,12 @@ class WindowsSandboxService(SandboxService):
         def _expire():
             logger.info("Sandbox %s expired, destroying VM", meta.sandbox_id)
             try:
-                self.delete_sandbox(meta.sandbox_id)
+                coro = self._async_delete_sandbox(meta.sandbox_id)
+                if self._event_loop and self._event_loop.is_running():
+                    future = asyncio.run_coroutine_threadsafe(coro, self._event_loop)
+                    future.result(timeout=60)
+                else:
+                    asyncio.run(coro)
             except Exception:
                 logger.exception("Failed to auto-delete expired sandbox %s", meta.sandbox_id)
 
@@ -175,6 +185,7 @@ class WindowsSandboxService(SandboxService):
     # ------------------------------------------------------------------
 
     async def create_sandbox(self, request: CreateSandboxRequest) -> CreateSandboxResponse:
+        self._capture_event_loop()
         sandbox_id = self.generate_sandbox_id()
         now = datetime.now(timezone.utc)
 
@@ -188,11 +199,11 @@ class WindowsSandboxService(SandboxService):
                 },
             )
 
-        # Compute expiration
+        # Validate and compute expiration using shared validators
         expires_at = None
         if request.timeout is not None:
-            capped = min(request.timeout, self._max_timeout) if self._max_timeout else request.timeout
-            expires_at = datetime.fromtimestamp(now.timestamp() + capped, tz=timezone.utc)
+            ensure_timeout_within_limit(request.timeout, self._max_timeout)
+            expires_at = calculate_expiration_or_raise(now, request.timeout)
 
         # Parse resource limits using shared helpers
         cpus = None
@@ -249,7 +260,7 @@ class WindowsSandboxService(SandboxService):
 
         return CreateSandboxResponse(
             id=sandbox_id,
-            status=SandboxStatus(state="Running"),
+            status=SandboxStatus(state=VMState.RUNNING.value),
             metadata=request.metadata,
             platform=platform,
             expires_at=expires_at,
@@ -263,67 +274,91 @@ class WindowsSandboxService(SandboxService):
 
         sandboxes = [self._build_sandbox(m) for m in all_meta]
         filtered = [s for s in sandboxes if matches_filter(s, request.filter)]
-        total = len(filtered)
 
-        page = 1
-        page_size = 20
-        if request.pagination:
-            page = request.pagination.page
-            page_size = request.pagination.page_size
-        start = (page - 1) * page_size
-        page_items = filtered[start:start + page_size]
-
-        total_pages = (total + page_size - 1) // page_size if page_size else 1
-        return ListSandboxesResponse(
-            items=page_items,
-            pagination=PaginationInfo(
-                page=page,
-                page_size=page_size,
-                total_items=total,
-                total_pages=total_pages,
-                has_next_page=page < total_pages,
-            ),
-        )
+        page_items, pagination_info = paginate_list(filtered, request.pagination)
+        return ListSandboxesResponse(items=page_items, pagination=pagination_info)
 
     def get_sandbox(self, sandbox_id: str) -> Sandbox:
         meta = self._get_meta(sandbox_id)
         return self._build_sandbox(meta)
 
+    async def _async_delete_sandbox(self, sandbox_id: str) -> None:
+        """Async implementation of delete_sandbox, safe to call from any context."""
+        meta = self._get_meta(sandbox_id)
+        self._cancel_expiration(meta)
+
+        await self.vm_manager.destroy_vm(sandbox_id)
+
+        with self._lock:
+            self._meta.pop(sandbox_id, None)
+            meta.status = VMState.TERMINATED
+
     def delete_sandbox(self, sandbox_id: str) -> None:
         meta = self._get_meta(sandbox_id)
         self._cancel_expiration(meta)
 
-        self._run_async(self.vm_manager.destroy_vm(sandbox_id))
+        coro = self.vm_manager.destroy_vm(sandbox_id)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            # Called from async context — schedule as task and block via thread
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+            future.result(timeout=60)
+        else:
+            asyncio.run(coro)
 
         with self._lock:
             self._meta.pop(sandbox_id, None)
-            meta.status = "Terminated"
+            meta.status = VMState.TERMINATED
 
     def pause_sandbox(self, sandbox_id: str) -> None:
         meta = self._get_meta(sandbox_id)
-        if meta.status != "Running":
+        if meta.status != VMState.RUNNING:
             raise HTTPException(
                 status_code=409,
                 detail={"code": SandboxErrorCodes.WINDOWS_VM_NOT_RUNNING, "message": "Sandbox is not running"},
             )
 
-        self._run_async(self.vm_manager.pause_vm(sandbox_id))
+        coro = self.vm_manager.pause_vm(sandbox_id)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+            future.result(timeout=60)
+        else:
+            asyncio.run(coro)
 
         with self._lock:
-            meta.status = "Paused"
+            meta.status = VMState.PAUSED
 
     def resume_sandbox(self, sandbox_id: str) -> None:
         meta = self._get_meta(sandbox_id)
-        if meta.status != "Paused":
+        if meta.status != VMState.PAUSED:
             raise HTTPException(
                 status_code=409,
                 detail={"code": SandboxErrorCodes.WINDOWS_VM_NOT_RUNNING, "message": "Sandbox is not paused"},
             )
 
-        self._run_async(self.vm_manager.resume_vm(sandbox_id))
+        coro = self.vm_manager.resume_vm(sandbox_id)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+            future.result(timeout=60)
+        else:
+            asyncio.run(coro)
 
         with self._lock:
-            meta.status = "Running"
+            meta.status = VMState.RUNNING
 
     def renew_expiration(
         self, sandbox_id: str, request: RenewSandboxExpirationRequest,
@@ -331,9 +366,7 @@ class WindowsSandboxService(SandboxService):
         meta = self._get_meta(sandbox_id)
         self._cancel_expiration(meta)
 
-        new_expires = request.expires_at
-        if new_expires.tzinfo is None:
-            new_expires = new_expires.replace(tzinfo=timezone.utc)
+        new_expires = ensure_future_expiration(request.expires_at)
 
         with self._lock:
             meta.expires_at = new_expires
@@ -408,3 +441,11 @@ class WindowsSandboxService(SandboxService):
             )
 
         return Endpoint(endpoint=f"{vm.guest_ip}:{port}")
+
+    # ------------------------------------------------------------------
+    # ExtensionService
+    # ------------------------------------------------------------------
+
+    def get_access_renew_extend_seconds(self, sandbox_id: str) -> Optional[int]:
+        """Windows VMs do not store renew-extend metadata; always returns None."""
+        return None

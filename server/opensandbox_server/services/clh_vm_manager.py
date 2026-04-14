@@ -71,6 +71,7 @@ class CLHVMManager:
         self.vms: dict[str, CLHVMInstance] = {}
         self._ip_counter = 2  # Start at .2 (bridge is .1)
         self._http_client: Optional[httpx.AsyncClient] = None
+        self._vm_lock = asyncio.Lock()
         self._ensure_directories()
 
     def _ensure_directories(self):
@@ -144,7 +145,7 @@ class CLHVMManager:
         return ":".join(f"{b:02x}" for b in octets)
 
     def _allocate_ip(self) -> str:
-        """Allocate an unused guest IP on the bridge subnet (10.44.0.0/24)."""
+        """Allocate a placeholder IP. Real IP is discovered after boot via _discover_guest_ip."""
         used = {vm.guest_ip for vm in self.vms.values()}
         for _ in range(253):
             ip = f"10.44.0.{self._ip_counter}"
@@ -152,6 +153,31 @@ class CLHVMManager:
             if ip not in used:
                 return ip
         raise RuntimeError("IP pool exhausted (10.44.0.0/24)")
+
+    async def _discover_guest_ip(self, mac_address: str, timeout: float = 30) -> Optional[str]:
+        """Discover guest IP by looking up MAC in ARP table after DHCP."""
+        mac_lower = mac_address.lower()
+        deadline = time.time() + timeout
+        delay = 1.0
+        while time.time() < deadline:
+            # Check ARP table for our MAC
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "ip", "neigh", "show",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await proc.communicate()
+                for line in stdout.decode().splitlines():
+                    # Format: "10.44.0.5 dev osbr0 lladdr 52:54:00:xx:xx:xx REACHABLE"
+                    parts = line.split()
+                    if len(parts) >= 5 and parts[4].lower() == mac_lower:
+                        return parts[0]
+            except Exception:
+                pass
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.5, 5.0)
+        return None
 
     async def _create_tap(self, sandbox_id: str) -> str:
         """Create a TAP device and attach it to the bridge."""
@@ -197,22 +223,37 @@ class CLHVMManager:
         memory_mb: Optional[int] = None,
     ) -> CLHVMInstance:
         """Create and boot a Windows VM via Cloud Hypervisor."""
-        if sandbox_id in self.vms:
-            raise ValueError(f"VM {sandbox_id} already exists")
+        async with self._vm_lock:
+            if sandbox_id in self.vms:
+                raise ValueError(f"VM {sandbox_id} already exists")
 
-        effective_cpus = cpus or self.config.default_cpus
-        effective_memory = memory_mb or self.config.default_memory_mb
+            effective_cpus = cpus or self.config.default_cpus
+            effective_memory = memory_mb or self.config.default_memory_mb
 
-        overlay_path = await self._create_overlay(sandbox_id, image_name)
-        tap_device = await self._create_tap(sandbox_id)
-        mac_address = self._generate_mac()
-        guest_ip = self._allocate_ip()
+            mac_address = self._generate_mac()
+            guest_ip = self._allocate_ip()
+
+        # Overlay and TAP creation are independent — run in parallel
+        overlay_path, tap_device = await asyncio.gather(
+            self._create_overlay(sandbox_id, image_name),
+            self._create_tap(sandbox_id),
+        )
 
         api_socket = Path(self.config.api_socket_dir) / f"{sandbox_id}.sock"
 
-        cmd = [
-            self.config.clh_binary,
-            "--kernel", self.config.firmware,
+        cmd = [self.config.clh_binary]
+
+        # Direct kernel boot (kernel + initrd + cmdline) or firmware boot
+        if self.config.kernel:
+            cmd += ["--kernel", self.config.kernel]
+            if self.config.initrd:
+                cmd += ["--initramfs", self.config.initrd]
+            if self.config.cmdline:
+                cmd += ["--cmdline", self.config.cmdline]
+        else:
+            cmd += ["--kernel", self.config.firmware]
+
+        cmd += [
             "--disk", f"path={overlay_path}",
             "--cpus", f"boot={effective_cpus}",
             "--memory", f"size={effective_memory}M",
@@ -223,17 +264,21 @@ class CLHVMManager:
         ]
 
         if self.config.hyperv_enlightenments:
-            # Append kvm_hyperv to the existing --cpus arg
             cmd[cmd.index("--cpus") + 1] += ",kvm_hyperv=on"
 
+        # Log full command for debugging
         logger.info(
-            "Starting CLH VM %s: cpus=%d, memory=%dMB, image=%s",
-            sandbox_id, effective_cpus, effective_memory, image_name,
+            "Starting CLH VM %s: cpus=%d, memory=%dMB, image=%s, cmd=%s",
+            sandbox_id, effective_cpus, effective_memory, image_name, " ".join(cmd),
         )
+
+        # Log serial output to file for debugging boot issues
+        serial_log = Path(self.config.api_socket_dir) / f"{sandbox_id}.serial.log"
+        serial_fh = open(serial_log, "w")
 
         process = await asyncio.create_subprocess_exec(
             *cmd,
-            stdout=asyncio.subprocess.PIPE,
+            stdout=serial_fh,
             stderr=asyncio.subprocess.PIPE,
         )
 
@@ -250,6 +295,16 @@ class CLHVMManager:
             execd_port=self.config.execd_port,
         )
 
+        # Discover actual guest IP from ARP (DHCP may assign different IP than placeholder)
+        discovered_ip = await self._discover_guest_ip(mac_address, timeout=30)
+        if discovered_ip and discovered_ip != guest_ip:
+            logger.info("VM %s: discovered IP %s (placeholder was %s)", sandbox_id, discovered_ip, guest_ip)
+            vm.guest_ip = discovered_ip
+        elif discovered_ip:
+            logger.info("VM %s: guest IP confirmed %s", sandbox_id, discovered_ip)
+        else:
+            logger.warning("VM %s: could not discover IP via ARP, using placeholder %s", sandbox_id, guest_ip)
+
         try:
             await self._wait_for_execd(vm)
         except TimeoutError:
@@ -257,13 +312,15 @@ class CLHVMManager:
             await self._force_destroy(vm)
             raise
 
-        self.vms[sandbox_id] = vm
-        logger.info("VM %s is ready (pid=%s, ip=%s)", sandbox_id, process.pid, guest_ip)
+        async with self._vm_lock:
+            self.vms[sandbox_id] = vm
+        logger.info("VM %s is ready (pid=%s, ip=%s)", sandbox_id, process.pid, vm.guest_ip)
         return vm
 
     async def destroy_vm(self, sandbox_id: str):
         """Stop a VM and clean up all associated resources."""
-        vm = self.vms.pop(sandbox_id, None)
+        async with self._vm_lock:
+            vm = self.vms.pop(sandbox_id, None)
         if vm is None:
             raise KeyError(f"VM {sandbox_id} not found")
 
@@ -379,9 +436,8 @@ class CLHVMManager:
     # CLH API socket communication
     # ------------------------------------------------------------------
 
-    @staticmethod
     async def _clh_api_request(
-        socket_path: Path, method: str, path: str, body: Optional[dict] = None,
+        self, socket_path: Path, method: str, path: str, body: Optional[dict] = None,
     ) -> dict:
         """Send a request to the CLH HTTP API via Unix domain socket."""
         transport = httpx.AsyncHTTPTransport(uds=str(socket_path))
