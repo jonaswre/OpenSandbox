@@ -37,6 +37,8 @@ func (c *Controller) Interrupt(sessionID string) error {
 	case c.getCommandKernel(sessionID) != nil:
 		kernel := c.getCommandKernel(sessionID)
 		return c.killPid(kernel.pid)
+	case c.getPowershellSession(sessionID) != nil:
+		return c.closePowershellSession(sessionID)
 	default:
 		return errors.New("no such session")
 	}

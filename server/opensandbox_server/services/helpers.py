@@ -26,7 +26,7 @@ import re
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
-from opensandbox_server.api.schema import Endpoint, Sandbox, SandboxFilter
+from opensandbox_server.api.schema import Endpoint, PaginationInfo, PaginationRequest, Sandbox, SandboxFilter
 from opensandbox_server.services.constants import OPEN_SANDBOX_INGRESS_HEADER
 from opensandbox_server.config import (
     GATEWAY_ROUTE_MODE_HEADER,
@@ -140,6 +140,33 @@ def normalize_external_endpoint_url(endpoint: str, default_scheme: str = "https"
     return f"{default_scheme}://{endpoint}"
 
 
+def paginate_list(
+    items: list,
+    pagination: Optional[PaginationRequest] = None,
+    default_page_size: int = 20,
+) -> tuple[list, PaginationInfo]:
+    """Apply pagination to a pre-filtered list and return the page with metadata."""
+    if pagination:
+        page = pagination.page
+        page_size = pagination.page_size
+    else:
+        page = 1
+        page_size = default_page_size
+
+    total_items = len(items)
+    total_pages = (total_items + page_size - 1) // page_size if total_items else 0
+    start = (page - 1) * page_size
+    page_items = items[start:start + page_size]
+
+    return page_items, PaginationInfo(
+        page=page,
+        page_size=page_size,
+        total_items=total_items,
+        total_pages=total_pages,
+        has_next_page=page < total_pages,
+    )
+
+
 def matches_filter(sandbox: Sandbox, filter_: SandboxFilter) -> bool:
     """Apply state/metadata filters to a sandbox instance."""
     if not filter_:
@@ -203,4 +230,5 @@ __all__ = [
     "normalize_external_endpoint_url",
     "format_ingress_endpoint",
     "matches_filter",
+    "paginate_list",
 ]

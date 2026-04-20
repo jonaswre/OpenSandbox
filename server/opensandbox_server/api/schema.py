@@ -328,6 +328,15 @@ class CreateSandboxRequest(BaseModel):
     Request to create a new sandbox from a container image.
     """
     image: ImageSpec = Field(..., description="Container image specification for the sandbox")
+    guest_os: Literal["linux", "windows"] = Field(
+        default="linux",
+        alias="guestOs",
+        description=(
+            "Guest operating system type. 'linux' uses the standard container runtime. "
+            "'windows' uses Cloud Hypervisor to boot a Windows VM. "
+            "When 'windows', the image URI refers to a pre-built Windows disk image name."
+        ),
+    )
     platform: Optional[PlatformSpec] = Field(
         None,
         description=(

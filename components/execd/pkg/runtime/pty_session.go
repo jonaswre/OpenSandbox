@@ -23,8 +23,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"sync"
-	"sync/atomic"
 	"syscall"
 
 	"github.com/alibaba/opensandbox/internal/safego"
@@ -33,31 +31,8 @@ import (
 	"github.com/alibaba/opensandbox/execd/pkg/log"
 )
 
-// PTYSession is the public interface for an interactive PTY/pipe session.
-// The concrete implementation (*ptySession) is unexported; callers outside
-// this package must use this interface.
-type PTYSession interface {
-	LockWS() bool
-	UnlockWS()
-	IsRunning() bool
-	IsPTY() bool
-	ExitCode() int
-	Done() <-chan struct{}
-	StartPTY() error
-	StartPipe() error
-	WriteStdin(p []byte) (int, error)
-	AttachOutput() (io.Reader, io.Reader, func())
-	AttachOutputWithSnapshot(since int64) (io.Reader, io.Reader, func(), []byte, int64)
-	SendSignal(name string)
-	ResizePTY(cols, rows uint16) error
-}
-
 // IsPTYSessionSupported reports whether PTY sessions are supported on this platform.
 func IsPTYSessionSupported() bool { return true }
-
-func NewPTYSessionID() string {
-	return uuidString()
-}
 
 // ptySession manages a single interactive PTY or pipe-mode bash process.
 //
@@ -68,56 +43,20 @@ func NewPTYSessionID() string {
 //  4. The bash process exits → Done() closes → exit frame sent.
 //  5. Call close() to terminate an early session and release resources.
 type ptySession struct {
-	id  string
-	cwd string
-
-	mu      sync.Mutex
-	closing bool
+	ptySessionBase
 
 	// Process tracking (guarded by mu)
-	pid          int           // PID of the running bash process (0 = not running)
-	lastExitCode int           // exit code; -1 until process exits
-	doneCh       chan struct{} // closed when process exits (non-nil after Start*)
-
-	// Stdin (PTY master in PTY mode; write end of os.Pipe in pipe mode)
-	stdin io.WriteCloser
+	pid int // PID of the running bash process (0 = not running)
 
 	// PTY-specific
 	isPTY bool
 	ptmx  *os.File // PTY master fd; nil in pipe mode
-
-	// Replay
-	replay *replayBuffer
-
-	// WS exclusive lock: only one WebSocket client at a time.
-	wsConnected atomic.Bool
-
-	// Output broadcast (guards stdoutW / stderrW).
-	// The broadcast goroutine holds outMu only while reading the pointer; writes
-	// to the pipe happen outside the lock to avoid blocking broadcast on slow clients.
-	outMu   sync.Mutex
-	stdoutW *io.PipeWriter // current per-connection sink; nil when no client attached
-	stderrW *io.PipeWriter // nil in PTY mode
 }
 
 func newPTYSession(id, cwd string) *ptySession {
 	return &ptySession{
-		id:           id,
-		cwd:          cwd,
-		replay:       newReplayBuffer(),
-		lastExitCode: -1,
+		ptySessionBase: newPTYSessionBase(id, cwd),
 	}
-}
-
-// LockWS attempts to acquire the exclusive WebSocket connection lock.
-// Returns true on success, false if another client is already connected.
-func (s *ptySession) LockWS() bool {
-	return s.wsConnected.CompareAndSwap(false, true)
-}
-
-// UnlockWS releases the WebSocket connection lock.
-func (s *ptySession) UnlockWS() {
-	s.wsConnected.Store(false)
 }
 
 // IsRunning returns true if the bash process is currently alive.
@@ -130,26 +69,6 @@ func (s *ptySession) IsRunning() bool {
 // IsPTY returns true when the session was started in PTY mode.
 func (s *ptySession) IsPTY() bool {
 	return s.isPTY
-}
-
-// ExitCode returns the exit code of the last process, or -1 if it has not exited yet.
-func (s *ptySession) ExitCode() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.lastExitCode
-}
-
-// Done returns a channel that is closed when the bash process exits.
-// Returns nil if the process has not been started yet.
-func (s *ptySession) Done() <-chan struct{} {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.doneCh
-}
-
-// ReplayBuffer returns the session's replay buffer (thread-safe).
-func (s *ptySession) ReplayBuffer() *replayBuffer {
-	return s.replay
 }
 
 // StartPTY launches bash via pty.StartWithSize.
@@ -274,46 +193,6 @@ func (s *ptySession) broadcastPTY() {
 	}
 }
 
-// broadcastPipe reads from a pipe (stdout or stderr) and fans out to replay + active WS client.
-func (s *ptySession) broadcastPipe(r *os.File, isStdout bool) {
-	buf := make([]byte, 32*1024)
-	for {
-		n, err := r.Read(buf)
-		if n > 0 {
-			s.writeAndFanout(buf[:n], isStdout)
-		}
-		if err != nil {
-			break
-		}
-	}
-	_ = r.Close()
-}
-
-// writeAndFanout writes chunk to the replay buffer and delivers it to the
-// active per-connection pipe, atomically under outMu.
-//
-// Holding outMu across both operations closes the window where bytes written
-// to replay after ReadFrom but before AttachOutput would be silently dropped.
-// Lock order is always outMu → replay.mu (both paths), so no deadlock is possible.
-func (s *ptySession) writeAndFanout(chunk []byte, isStdout bool) {
-	s.outMu.Lock()
-	s.replay.write(chunk) // acquires replay.mu inside (outMu → replay.mu)
-	var w *io.PipeWriter
-	if isStdout {
-		w = s.stdoutW
-	} else {
-		w = s.stderrW
-	}
-	s.outMu.Unlock()
-
-	if w != nil {
-		if _, err := w.Write(chunk); err != nil {
-			// Pipe was closed (client detached) — ignore.
-			log.Warning("pty fanout write: %v", err)
-		}
-	}
-}
-
 // waitAndExit waits for the PTY-mode process and updates session state on exit.
 func (s *ptySession) waitAndExit(cmd *exec.Cmd, ptmx *os.File) {
 	_ = cmd.Wait()
@@ -352,17 +231,6 @@ func (s *ptySession) waitAndExitPipe(cmd *exec.Cmd, stdinW, stdoutR, stderrR *os
 	s.mu.Unlock()
 
 	close(doneCh)
-}
-
-// WriteStdin writes p to bash stdin (PTY master or pipe write-end).
-func (s *ptySession) WriteStdin(p []byte) (int, error) {
-	s.mu.Lock()
-	w := s.stdin
-	s.mu.Unlock()
-	if w == nil {
-		return 0, errors.New("session not started")
-	}
-	return w.Write(p)
 }
 
 // AttachOutput creates a fresh per-connection io.Pipe and swaps it into the

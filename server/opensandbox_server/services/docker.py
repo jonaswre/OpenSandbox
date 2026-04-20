@@ -87,6 +87,7 @@ from opensandbox_server.services.endpoint_auth import (
 )
 from opensandbox_server.services.helpers import (
     matches_filter,
+    paginate_list,
     parse_memory_limit,
     parse_nano_cpus,
     parse_timestamp,
@@ -1687,27 +1688,7 @@ class DockerSandboxService(DockerDiagnosticsMixin, OSSFSMixin, SandboxService, E
 
         sandboxes.sort(key=lambda s: s.created_at or datetime.min, reverse=True)
 
-        if request.pagination:
-            page = request.pagination.page
-            page_size = request.pagination.page_size
-        else:
-            page = 1
-            page_size = 20
-
-        total_items = len(sandboxes)
-        total_pages = math.ceil(total_items / page_size) if total_items else 0
-        start_index = (page - 1) * page_size
-        end_index = start_index + page_size
-        items = sandboxes[start_index:end_index]
-        has_next_page = page < total_pages
-
-        pagination_info = PaginationInfo(
-            page=page,
-            page_size=page_size,
-            total_items=total_items,
-            total_pages=total_pages,
-            has_next_page=has_next_page,
-        )
+        items, pagination_info = paginate_list(sandboxes, request.pagination)
 
         return ListSandboxesResponse(items=items, pagination=pagination_info)
 
